@@ -8,5 +8,9 @@ dependencies = [
     "gymnasium>=1.2.2",
     "numpy>=2.3.5",
     "pandas>=2.3.3",
+    "pyngs",
     "stable-baselines3>=2.7.1",
 ]
+
+[tool.uv.sources]
+pyngs = { path = "pyngs-0.0.2-cp312-cp312-linux_x86_64.whl" }

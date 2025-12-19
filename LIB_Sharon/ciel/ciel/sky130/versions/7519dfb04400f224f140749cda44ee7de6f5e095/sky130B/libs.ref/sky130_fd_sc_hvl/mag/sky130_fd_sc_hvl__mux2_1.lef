@@ -1,0 +1,148 @@
+VERSION 5.7 ;
+  NOWIREEXTENSIONATPIN ON ;
+  DIVIDERCHAR "/" ;
+  BUSBITCHARS "[]" ;
+MACRO sky130_fd_sc_hvl__mux2_1
+  CLASS BLOCK ;
+  FOREIGN sky130_fd_sc_hvl__mux2_1 ;
+  ORIGIN 0.000 0.000 ;
+  SIZE 5.280 BY 4.070 ;
+  PIN A0
+    ANTENNAGATEAREA 0.420000 ;
+    PORT
+      LAYER li1 ;
+        RECT 2.295 1.955 2.625 2.235 ;
+        RECT 2.295 1.785 2.905 1.955 ;
+        RECT 2.735 1.390 2.905 1.785 ;
+        RECT 2.735 1.095 3.685 1.390 ;
+    END
+  END A0
+  PIN A1
+    ANTENNAGATEAREA 0.420000 ;
+    PORT
+      LAYER li1 ;
+        RECT 3.085 1.570 3.685 1.955 ;
+    END
+  END A1
+  PIN S
+    ANTENNAGATEAREA 0.840000 ;
+    PORT
+      LAYER li1 ;
+        RECT 1.435 3.095 3.230 3.265 ;
+        RECT 1.435 1.705 1.765 3.095 ;
+        RECT 3.060 2.305 3.230 3.095 ;
+        RECT 3.060 2.135 4.675 2.305 ;
+        RECT 4.365 1.550 4.675 2.135 ;
+    END
+  END S
+  PIN VGND
+    USE GROUND ;
+    PORT
+      LAYER li1 ;
+        RECT 0.595 0.365 2.205 1.175 ;
+        RECT 3.060 0.365 4.720 0.915 ;
+      LAYER mcon ;
+        RECT 0.595 0.395 0.765 0.565 ;
+        RECT 0.955 0.395 1.125 0.565 ;
+        RECT 1.315 0.395 1.485 0.565 ;
+        RECT 1.675 0.395 1.845 0.565 ;
+        RECT 2.035 0.395 2.205 0.565 ;
+        RECT 3.085 0.395 3.255 0.565 ;
+        RECT 3.445 0.395 3.615 0.565 ;
+        RECT 3.805 0.395 3.975 0.565 ;
+        RECT 4.165 0.395 4.335 0.565 ;
+        RECT 4.525 0.395 4.695 0.565 ;
+      LAYER met1 ;
+        RECT 0.000 0.255 5.280 0.625 ;
+    END
+  END VGND
+  PIN VNB
+    ANTENNADIFFAREA 0.897600 ;
+    PORT
+      LAYER pwell ;
+        RECT 0.055 1.085 1.385 1.415 ;
+        RECT 0.055 0.215 5.260 1.085 ;
+        RECT -0.130 -0.215 5.410 0.215 ;
+      LAYER li1 ;
+        RECT 0.000 -0.085 5.280 0.085 ;
+      LAYER mcon ;
+        RECT 0.155 -0.085 0.325 0.085 ;
+        RECT 0.635 -0.085 0.805 0.085 ;
+        RECT 1.115 -0.085 1.285 0.085 ;
+        RECT 1.595 -0.085 1.765 0.085 ;
+        RECT 2.075 -0.085 2.245 0.085 ;
+        RECT 2.555 -0.085 2.725 0.085 ;
+        RECT 3.035 -0.085 3.205 0.085 ;
+        RECT 3.515 -0.085 3.685 0.085 ;
+        RECT 3.995 -0.085 4.165 0.085 ;
+        RECT 4.475 -0.085 4.645 0.085 ;
+        RECT 4.955 -0.085 5.125 0.085 ;
+      LAYER met1 ;
+        RECT 0.000 -0.115 5.280 0.115 ;
+    END
+  END VNB
+  PIN VPB
+    ANTENNADIFFAREA 0.897600 ;
+    PORT
+      LAYER nwell ;
+        RECT -0.330 1.885 5.610 4.485 ;
+      LAYER li1 ;
+        RECT 0.000 3.985 5.280 4.155 ;
+      LAYER mcon ;
+        RECT 0.155 3.985 0.325 4.155 ;
+        RECT 0.635 3.985 0.805 4.155 ;
+        RECT 1.115 3.985 1.285 4.155 ;
+        RECT 1.595 3.985 1.765 4.155 ;
+        RECT 2.075 3.985 2.245 4.155 ;
+        RECT 2.555 3.985 2.725 4.155 ;
+        RECT 3.035 3.985 3.205 4.155 ;
+        RECT 3.515 3.985 3.685 4.155 ;
+        RECT 3.995 3.985 4.165 4.155 ;
+        RECT 4.475 3.985 4.645 4.155 ;
+        RECT 4.955 3.985 5.125 4.155 ;
+      LAYER met1 ;
+        RECT 0.000 3.955 5.280 4.185 ;
+    END
+  END VPB
+  PIN VPWR
+    USE POWER ;
+    PORT
+      LAYER li1 ;
+        RECT 0.675 2.175 1.255 3.755 ;
+        RECT 3.410 2.495 4.720 3.705 ;
+      LAYER mcon ;
+        RECT 0.700 3.505 0.870 3.675 ;
+        RECT 1.060 3.505 1.230 3.675 ;
+        RECT 3.440 3.505 3.610 3.675 ;
+        RECT 3.800 3.505 3.970 3.675 ;
+        RECT 4.160 3.505 4.330 3.675 ;
+        RECT 4.520 3.505 4.690 3.675 ;
+      LAYER met1 ;
+        RECT 0.000 3.445 5.280 3.815 ;
+    END
+  END VPWR
+  PIN X
+    ANTENNADIFFAREA 0.641250 ;
+    PORT
+      LAYER li1 ;
+        RECT 0.125 1.925 0.495 3.755 ;
+        RECT 0.125 0.495 0.415 1.925 ;
+    END
+  END X
+  OBS
+      LAYER li1 ;
+        RECT 2.550 2.585 2.880 2.915 ;
+        RECT 1.945 2.415 2.880 2.585 ;
+        RECT 0.620 1.525 0.950 1.745 ;
+        RECT 1.945 1.525 2.115 2.415 ;
+        RECT 0.620 1.355 2.555 1.525 ;
+        RECT 2.385 0.915 2.555 1.355 ;
+        RECT 3.865 1.275 4.115 1.775 ;
+        RECT 4.900 1.275 5.150 2.915 ;
+        RECT 3.865 1.105 5.150 1.275 ;
+        RECT 2.385 0.495 2.880 0.915 ;
+        RECT 4.900 0.495 5.150 1.105 ;
+  END
+END sky130_fd_sc_hvl__mux2_1
+END LIBRARY
+

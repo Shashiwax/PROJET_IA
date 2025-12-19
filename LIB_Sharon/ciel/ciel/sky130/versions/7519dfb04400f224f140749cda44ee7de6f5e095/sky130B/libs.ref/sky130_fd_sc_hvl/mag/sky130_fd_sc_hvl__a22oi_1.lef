@@ -1,0 +1,131 @@
+VERSION 5.7 ;
+  NOWIREEXTENSIONATPIN ON ;
+  DIVIDERCHAR "/" ;
+  BUSBITCHARS "[]" ;
+MACRO sky130_fd_sc_hvl__a22oi_1
+  CLASS BLOCK ;
+  FOREIGN sky130_fd_sc_hvl__a22oi_1 ;
+  ORIGIN 0.000 0.000 ;
+  SIZE 3.840 BY 4.070 ;
+  PIN A1
+    ANTENNAGATEAREA 1.125000 ;
+    PORT
+      LAYER li1 ;
+        RECT 2.045 1.505 2.755 1.750 ;
+    END
+  END A1
+  PIN A2
+    ANTENNAGATEAREA 1.125000 ;
+    PORT
+      LAYER li1 ;
+        RECT 2.940 1.505 3.715 1.750 ;
+    END
+  END A2
+  PIN B1
+    ANTENNAGATEAREA 1.125000 ;
+    PORT
+      LAYER li1 ;
+        RECT 1.465 1.505 1.795 1.750 ;
+    END
+  END B1
+  PIN B2
+    ANTENNAGATEAREA 1.125000 ;
+    PORT
+      LAYER li1 ;
+        RECT 0.125 1.505 0.835 1.835 ;
+    END
+  END B2
+  PIN VGND
+    USE GROUND ;
+    PORT
+      LAYER li1 ;
+        RECT 0.090 0.365 0.680 1.325 ;
+        RECT 2.135 0.365 3.750 1.325 ;
+      LAYER mcon ;
+        RECT 0.120 0.395 0.290 0.565 ;
+        RECT 0.480 0.395 0.650 0.565 ;
+        RECT 2.135 0.395 2.305 0.565 ;
+        RECT 2.495 0.395 2.665 0.565 ;
+        RECT 2.855 0.395 3.025 0.565 ;
+        RECT 3.215 0.395 3.385 0.565 ;
+        RECT 3.575 0.395 3.745 0.565 ;
+      LAYER met1 ;
+        RECT 0.000 0.255 3.840 0.625 ;
+    END
+  END VGND
+  PIN VNB
+    ANTENNADIFFAREA 0.652800 ;
+    PORT
+      LAYER pwell ;
+        RECT 0.105 0.215 3.635 1.415 ;
+        RECT -0.130 -0.215 3.970 0.215 ;
+      LAYER li1 ;
+        RECT 0.000 -0.085 3.840 0.085 ;
+      LAYER mcon ;
+        RECT 0.155 -0.085 0.325 0.085 ;
+        RECT 0.635 -0.085 0.805 0.085 ;
+        RECT 1.115 -0.085 1.285 0.085 ;
+        RECT 1.595 -0.085 1.765 0.085 ;
+        RECT 2.075 -0.085 2.245 0.085 ;
+        RECT 2.555 -0.085 2.725 0.085 ;
+        RECT 3.035 -0.085 3.205 0.085 ;
+        RECT 3.515 -0.085 3.685 0.085 ;
+      LAYER met1 ;
+        RECT 0.000 -0.115 3.840 0.115 ;
+    END
+  END VNB
+  PIN VPB
+    ANTENNADIFFAREA 0.652800 ;
+    PORT
+      LAYER nwell ;
+        RECT -0.330 1.885 4.170 4.485 ;
+      LAYER li1 ;
+        RECT 0.000 3.985 3.840 4.155 ;
+      LAYER mcon ;
+        RECT 0.155 3.985 0.325 4.155 ;
+        RECT 0.635 3.985 0.805 4.155 ;
+        RECT 1.115 3.985 1.285 4.155 ;
+        RECT 1.595 3.985 1.765 4.155 ;
+        RECT 2.075 3.985 2.245 4.155 ;
+        RECT 2.555 3.985 2.725 4.155 ;
+        RECT 3.035 3.985 3.205 4.155 ;
+        RECT 3.515 3.985 3.685 4.155 ;
+      LAYER met1 ;
+        RECT 0.000 3.955 3.840 4.185 ;
+    END
+  END VPB
+  PIN VPWR
+    USE POWER ;
+    PORT
+      LAYER li1 ;
+        RECT 2.135 2.280 3.085 3.755 ;
+      LAYER mcon ;
+        RECT 2.165 3.505 2.335 3.675 ;
+        RECT 2.525 3.505 2.695 3.675 ;
+        RECT 2.885 3.505 3.055 3.675 ;
+      LAYER met1 ;
+        RECT 0.000 3.445 3.840 3.815 ;
+    END
+  END VPWR
+  PIN Y
+    ANTENNADIFFAREA 0.630000 ;
+    PORT
+      LAYER li1 ;
+        RECT 0.925 2.175 1.285 3.455 ;
+        RECT 1.085 0.980 1.285 2.175 ;
+        RECT 1.705 0.980 1.955 1.325 ;
+        RECT 1.085 0.810 1.955 0.980 ;
+        RECT 1.705 0.495 1.955 0.810 ;
+    END
+  END Y
+  OBS
+      LAYER li1 ;
+        RECT 0.145 3.635 1.955 3.805 ;
+        RECT 0.145 2.175 0.475 3.635 ;
+        RECT 1.705 2.100 1.955 3.635 ;
+        RECT 3.265 2.100 3.595 3.755 ;
+        RECT 1.705 1.930 3.595 2.100 ;
+  END
+END sky130_fd_sc_hvl__a22oi_1
+END LIBRARY
+

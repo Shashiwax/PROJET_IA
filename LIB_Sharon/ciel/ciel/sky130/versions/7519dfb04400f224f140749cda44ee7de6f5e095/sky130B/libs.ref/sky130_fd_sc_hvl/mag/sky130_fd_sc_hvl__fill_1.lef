@@ -1,0 +1,52 @@
+VERSION 5.7 ;
+  NOWIREEXTENSIONATPIN ON ;
+  DIVIDERCHAR "/" ;
+  BUSBITCHARS "[]" ;
+MACRO sky130_fd_sc_hvl__fill_1
+  CLASS BLOCK ;
+  FOREIGN sky130_fd_sc_hvl__fill_1 ;
+  ORIGIN 0.000 0.000 ;
+  SIZE 0.480 BY 4.070 ;
+  PIN VGND
+    USE GROUND ;
+    PORT
+      LAYER met1 ;
+        RECT 0.000 0.255 0.480 0.625 ;
+    END
+  END VGND
+  PIN VNB
+    ANTENNADIFFAREA 0.081600 ;
+    PORT
+      LAYER pwell ;
+        RECT -0.130 -0.215 0.610 0.215 ;
+      LAYER li1 ;
+        RECT 0.000 -0.085 0.480 0.085 ;
+      LAYER mcon ;
+        RECT 0.155 -0.085 0.325 0.085 ;
+      LAYER met1 ;
+        RECT 0.000 -0.115 0.480 0.115 ;
+    END
+  END VNB
+  PIN VPB
+    ANTENNADIFFAREA 0.081600 ;
+    PORT
+      LAYER nwell ;
+        RECT -0.330 1.885 0.810 4.485 ;
+      LAYER li1 ;
+        RECT 0.000 3.985 0.480 4.155 ;
+      LAYER mcon ;
+        RECT 0.155 3.985 0.325 4.155 ;
+      LAYER met1 ;
+        RECT 0.000 3.955 0.480 4.185 ;
+    END
+  END VPB
+  PIN VPWR
+    USE POWER ;
+    PORT
+      LAYER met1 ;
+        RECT 0.000 3.445 0.480 3.815 ;
+    END
+  END VPWR
+END sky130_fd_sc_hvl__fill_1
+END LIBRARY
+

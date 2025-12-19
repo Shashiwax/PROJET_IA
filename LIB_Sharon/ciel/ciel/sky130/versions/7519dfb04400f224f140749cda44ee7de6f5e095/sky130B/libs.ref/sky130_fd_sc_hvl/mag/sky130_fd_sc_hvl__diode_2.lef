@@ -1,0 +1,62 @@
+VERSION 5.7 ;
+  NOWIREEXTENSIONATPIN ON ;
+  DIVIDERCHAR "/" ;
+  BUSBITCHARS "[]" ;
+MACRO sky130_fd_sc_hvl__diode_2
+  CLASS BLOCK ;
+  FOREIGN sky130_fd_sc_hvl__diode_2 ;
+  ORIGIN 0.000 0.000 ;
+  SIZE 0.960 BY 4.070 ;
+  PIN DIODE
+    ANTENNADIFFAREA 0.607200 ;
+    PORT
+      LAYER li1 ;
+        RECT 0.105 0.515 0.855 3.280 ;
+    END
+  END DIODE
+  PIN VGND
+    USE GROUND ;
+    PORT
+      LAYER met1 ;
+        RECT 0.000 0.255 0.960 0.625 ;
+    END
+  END VGND
+  PIN VNB
+    ANTENNADIFFAREA 0.163200 ;
+    PORT
+      LAYER pwell ;
+        RECT 0.020 0.215 0.940 1.585 ;
+        RECT -0.130 -0.215 1.090 0.215 ;
+      LAYER li1 ;
+        RECT 0.000 -0.085 0.960 0.085 ;
+      LAYER mcon ;
+        RECT 0.155 -0.085 0.325 0.085 ;
+        RECT 0.635 -0.085 0.805 0.085 ;
+      LAYER met1 ;
+        RECT 0.000 -0.115 0.960 0.115 ;
+    END
+  END VNB
+  PIN VPB
+    ANTENNADIFFAREA 0.163200 ;
+    PORT
+      LAYER nwell ;
+        RECT -0.330 1.885 1.290 4.485 ;
+      LAYER li1 ;
+        RECT 0.000 3.985 0.960 4.155 ;
+      LAYER mcon ;
+        RECT 0.155 3.985 0.325 4.155 ;
+        RECT 0.635 3.985 0.805 4.155 ;
+      LAYER met1 ;
+        RECT 0.000 3.955 0.960 4.185 ;
+    END
+  END VPB
+  PIN VPWR
+    USE POWER ;
+    PORT
+      LAYER met1 ;
+        RECT 0.000 3.445 0.960 3.815 ;
+    END
+  END VPWR
+END sky130_fd_sc_hvl__diode_2
+END LIBRARY
+

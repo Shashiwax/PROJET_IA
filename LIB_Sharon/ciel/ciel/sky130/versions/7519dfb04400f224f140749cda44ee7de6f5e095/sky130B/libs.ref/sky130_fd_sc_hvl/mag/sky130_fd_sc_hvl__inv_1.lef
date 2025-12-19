@@ -1,0 +1,82 @@
+VERSION 5.7 ;
+  NOWIREEXTENSIONATPIN ON ;
+  DIVIDERCHAR "/" ;
+  BUSBITCHARS "[]" ;
+MACRO sky130_fd_sc_hvl__inv_1
+  CLASS BLOCK ;
+  FOREIGN sky130_fd_sc_hvl__inv_1 ;
+  ORIGIN 0.000 0.000 ;
+  SIZE 1.440 BY 4.070 ;
+  PIN A
+    ANTENNAGATEAREA 1.125000 ;
+    PORT
+      LAYER li1 ;
+        RECT 0.125 1.550 0.835 1.935 ;
+    END
+  END A
+  PIN VGND
+    USE GROUND ;
+    PORT
+      LAYER li1 ;
+        RECT 0.090 0.365 0.680 1.325 ;
+      LAYER mcon ;
+        RECT 0.120 0.395 0.290 0.565 ;
+        RECT 0.480 0.395 0.650 0.565 ;
+      LAYER met1 ;
+        RECT 0.000 0.255 1.440 0.625 ;
+    END
+  END VGND
+  PIN VNB
+    ANTENNADIFFAREA 0.244800 ;
+    PORT
+      LAYER pwell ;
+        RECT 0.090 0.215 1.420 1.415 ;
+        RECT -0.130 -0.215 1.570 0.215 ;
+      LAYER li1 ;
+        RECT 0.000 -0.085 1.440 0.085 ;
+      LAYER mcon ;
+        RECT 0.155 -0.085 0.325 0.085 ;
+        RECT 0.635 -0.085 0.805 0.085 ;
+        RECT 1.115 -0.085 1.285 0.085 ;
+      LAYER met1 ;
+        RECT 0.000 -0.115 1.440 0.115 ;
+    END
+  END VNB
+  PIN VPB
+    ANTENNADIFFAREA 0.244800 ;
+    PORT
+      LAYER nwell ;
+        RECT -0.330 1.885 1.770 4.485 ;
+      LAYER li1 ;
+        RECT 0.000 3.985 1.440 4.155 ;
+      LAYER mcon ;
+        RECT 0.155 3.985 0.325 4.155 ;
+        RECT 0.635 3.985 0.805 4.155 ;
+        RECT 1.115 3.985 1.285 4.155 ;
+      LAYER met1 ;
+        RECT 0.000 3.955 1.440 4.185 ;
+    END
+  END VPB
+  PIN VPWR
+    USE POWER ;
+    PORT
+      LAYER li1 ;
+        RECT 0.090 2.175 0.680 3.755 ;
+      LAYER mcon ;
+        RECT 0.120 3.505 0.290 3.675 ;
+        RECT 0.480 3.505 0.650 3.675 ;
+      LAYER met1 ;
+        RECT 0.000 3.445 1.440 3.815 ;
+    END
+  END VPWR
+  PIN Y
+    ANTENNADIFFAREA 0.641250 ;
+    PORT
+      LAYER li1 ;
+        RECT 0.960 2.175 1.345 3.755 ;
+        RECT 1.015 0.495 1.345 2.175 ;
+    END
+  END Y
+END sky130_fd_sc_hvl__inv_1
+END LIBRARY
+

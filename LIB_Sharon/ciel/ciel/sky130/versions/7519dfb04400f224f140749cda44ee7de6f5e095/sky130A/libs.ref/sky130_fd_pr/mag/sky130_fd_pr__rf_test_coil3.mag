@@ -1,0 +1,8 @@
+magic
+tech sky130A
+timestamp 1648464260
+<< properties >>
+string gencell sky130_fd_pr__rf_test_coil3
+string library sky130
+string parameter m=1
+<< end >>

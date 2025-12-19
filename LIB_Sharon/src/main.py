@@ -1,31 +1,50 @@
 from pathlib import Path
-from pyngs.core import NGSpiceInstance
 
-# Path relatif comme dans leur exemple
-netlist_path = Path("../netlists/rc.cir")
+import pandas as pd
 
-print(">>> Python script started")
+from pool import SequentialPool
 
-# Créer l’instance ngspice
-inst = NGSpiceInstance()
 
-# Charger la netlist
-inst.load(netlist_path)
+# Project root = one level above src/
+ROOT_DIR = Path(__file__).resolve().parents[1]
+NETLIST_DIR = ROOT_DIR / "netlists"
 
-# Lancer une première simulation
-inst.run()
 
-# Lister paramètres et mesures
-print("Parameters:", inst.list_parameters())
-print("Measures:", inst.list_measures())
+def main() -> None:
+    print(">>> main.py (partie 3) started")
 
-# Liste de paires (R, C)
-rc_values = [
-    (1e3, 1e-6),   # 1 kΩ, 1 µF
-    (1e4, 1e-6),   # 10 kΩ, 1 µF
-    (1e3, 1e-7),   # 1 kΩ, 0.1 µF
-    (5e3, 2e-6),   # 5 kΩ, 2 µF
-]
+    # For now we use a single RC netlist.
+    # You can later duplicate it (rc1.cir, rc2.cir, ...) if needed.
+    netlists = [NETLIST_DIR / "rc.cir"]
 
-for R in rc_values:
-    pass
+    # DataFrame of parameter values:
+    # columns names are R_val, C_val (Python side)
+    values = pd.DataFrame(
+        {
+            "R_val": [1e3, 1e4, 1e3, 5e3],     # Ohms
+            "C_val": [1e-6, 1e-6, 1e-7, 2e-6],  # Farads
+        }
+    )
+
+    # Mapping from DataFrame columns -> SPICE .param names
+    # In rc.cir you used: .param Rval = ..., .param Cval = ...
+    param_mapping = {
+        "R_val": "Rval",
+        "C_val": "Cval",
+    }
+
+    # We know our netlist defines a .meas fcut
+    measures = ["fcut"]
+
+    # Use the pool as a context manager so that instances are closed automatically
+    with SequentialPool(netlists, param_mapping=param_mapping, measures=measures) as pool:
+        result_df = pool.run(values)
+
+    print("\nResults DataFrame:")
+    print(result_df)
+
+    print("\n>>> Done.")
+
+
+if __name__ == "__main__":
+    main()

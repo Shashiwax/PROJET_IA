@@ -1,130 +1,186 @@
 from __future__ import annotations
 
-from pathlib import Path
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterable, Mapping, List, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 from pyngs.core import NGSpiceInstance
 
 
-@dataclass
-class _Simulator:
-    """Small container to bind a netlist path with its NGSpice instance."""
+@contextmanager
+def _chdir(path: Optional[Path]):
+    """Temporarily change working directory (useful for relative .include in SPICE libs)."""
+    if path is None:
+        yield
+        return
+
+    old = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old)
+
+
+def _row_to_params(row: pd.Series) -> Dict[str, float]:
+    """Convert a pandas row to a plain dict of float parameters."""
+    params: Dict[str, float] = {}
+    for k, v in row.items():
+        if pd.isna(v):
+            continue
+        params[str(k)] = float(v)
+    return params
+
+
+def _simulate_one(job: "SimJob") -> Dict[str, Any]:
+    """Worker function: run one NGSpice simulation for one set of params."""
+    inst = NGSpiceInstance()
+    try:
+        with _chdir(job.ngspice_cwd):
+            inst.load(job.netlist_path)
+
+            for name, value in job.params.items():
+                inst.set_parameter(name, value)
+
+            inst.run()
+
+            measures = inst.list_measures()
+            out: Dict[str, Any] = {}
+            for m in measures:
+                out[m] = inst.get_measure(m)
+
+            return out
+    finally:
+        # Ensure simulator is stopped even if something fails
+        try:
+            inst.stop()
+        except Exception:
+            pass
+
+
+@dataclass(frozen=True)
+class SimJob:
     netlist_path: Path
-    instance: NGSpiceInstance
+    params: Dict[str, float]
+    ngspice_cwd: Optional[Path] = None
 
 
 class SequentialPool:
     """
-    Sequential pool of NGSpice simulators.
+    Sequential version: runs simulations one after another.
 
-    - Takes a list of netlist paths.
-    - For each row of a pandas DataFrame (parameter values),
-      it runs all netlists and collects .meas results.
+    Spec goal: pool = SequentialPool([...]); results = pool.run(values_df)
+    """
+
+    def __init__(self, netlists: Iterable[str | Path], ngspice_cwd: Optional[str | Path] = None):
+        self.netlists: List[Path] = [Path(p) for p in netlists]
+        if not self.netlists:
+            raise ValueError("netlists must contain at least one path")
+        self.ngspice_cwd: Optional[Path] = Path(ngspice_cwd) if ngspice_cwd is not None else None
+
+        # Pre-create instances (one per netlist), as requested by the spec.
+        self._instances: List[NGSpiceInstance] = []
+        for nl in self.netlists:
+            inst = NGSpiceInstance()
+            with _chdir(self.ngspice_cwd):
+                inst.load(nl)
+            self._instances.append(inst)
+
+        # Discover measure names once (requires a run in many setups).
+        self._measure_names: Optional[List[str]] = None
+
+    def _ensure_measure_names(self) -> List[str]:
+        if self._measure_names is not None:
+            return self._measure_names
+
+        # Use the first instance to discover measures
+        inst = self._instances[0]
+        with _chdir(self.ngspice_cwd):
+            inst.run()
+            self._measure_names = list(inst.list_measures())
+        return self._measure_names
+
+    def run(self, values: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(values, pd.DataFrame):
+            raise TypeError("values must be a pandas DataFrame")
+
+        measure_names = self._ensure_measure_names()
+
+        results: List[Dict[str, Any]] = []
+        n_inst = len(self._instances)
+
+        for i, (_, row) in enumerate(values.iterrows()):
+            inst = self._instances[i % n_inst]
+            params = _row_to_params(row)
+
+            with _chdir(self.ngspice_cwd):
+                for name, value in params.items():
+                    inst.set_parameter(name, value)
+                inst.run()
+
+                out: Dict[str, Any] = {}
+                for m in measure_names:
+                    out[m] = inst.get_measure(m)
+                results.append(out)
+
+        return pd.DataFrame(results)
+
+    def close(self) -> None:
+        for inst in self._instances:
+            try:
+                inst.stop()
+            except Exception:
+                pass
+
+
+class ParallelPool:
+    """
+    Parallel version: runs simulations in multiple processes.
+    Each job creates its own NGSpiceInstance (safer than sharing).
     """
 
     def __init__(
         self,
-        netlists: List[str | Path],
-        param_mapping: Mapping[str, str] | None = None,
-        measures: Iterable[str] | None = None,
-    ) -> None:
-        """
-        Parameters
-        ----------
-        netlists : list of str or Path
-            Paths to SPICE netlists (.cir files). All must define the same .param and .meas.
-        param_mapping : dict, optional
-            Maps DataFrame column names -> SPICE parameter names.
-            Example: {"R_val": "Rval", "C_val": "Cval"}.
-            If None, DataFrame column names are assumed to be the SPICE parameter names.
-        measures : iterable of str, optional
-            Names of .meas to retrieve (e.g. ["fcut"]).
-            If None, all measures from the first instance are used.
-        """
-        self.simulators: List[_Simulator] = []
-        self.param_mapping: Dict[str, str] | None = dict(param_mapping) if param_mapping is not None else None
+        netlists: Iterable[str | Path],
+        n_workers: Optional[int] = None,
+        ngspice_cwd: Optional[str | Path] = None,
+        maxtasksperchild: int = 1,
+    ):
+        self.netlists: List[Path] = [Path(p) for p in netlists]
+        if not self.netlists:
+            raise ValueError("netlists must contain at least one path")
 
-        # Create one NGSpiceInstance per netlist
-        for path in netlists:
-            p = Path(path)
-            inst = NGSpiceInstance()
-            inst.load(p)
-            self.simulators.append(_Simulator(netlist_path=p, instance=inst))
-
-        # Determine which measures to read
-        if measures is None and self.simulators:
-            measures = list(self.simulators[0].instance.list_measures())
-        self.measures: List[str] = list(measures or [])
-
-    # --------- Resource management helpers ---------
-
-    def close(self) -> None:
-        """Stop all NGSpice instances."""
-        for sim in self.simulators:
-            sim.instance.stop()
-
-    def __enter__(self) -> "SequentialPool":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    # --------- Main API ---------
+        self.ngspice_cwd: Optional[Path] = Path(ngspice_cwd) if ngspice_cwd is not None else None
+        self.n_workers = n_workers
+        self.maxtasksperchild = maxtasksperchild
 
     def run(self, values: pd.DataFrame) -> pd.DataFrame:
-        """
-        Run all netlists for each row of 'values'.
+        if not isinstance(values, pd.DataFrame):
+            raise TypeError("values must be a pandas DataFrame")
 
-        Parameters
-        ----------
-        values : pandas.DataFrame
-            Each row contains a set of parameter values.
-            Columns must match param_mapping keys (or SPICE parameter names if param_mapping is None).
+        if len(values) == 0:
+            return pd.DataFrame()
 
-        Returns
-        -------
-        pandas.DataFrame
-            DataFrame containing:
-            - original parameter columns
-            - one column per (netlist, measure).
-              If there is only one netlist, the column is simply the measure name (e.g. "fcut").
-              If there are several netlists, columns are named "<measure>_<netlist_stem>".
-        """
-        records: List[Dict[str, Any]] = []
+        # Create jobs (round-robin assignment across netlists)
+        jobs: List[SimJob] = []
+        for i, (_, row) in enumerate(values.iterrows()):
+            nl = self.netlists[i % len(self.netlists)]
+            jobs.append(SimJob(netlist_path=nl, params=_row_to_params(row), ngspice_cwd=self.ngspice_cwd))
 
-        for _, row in values.iterrows():
-            # Start record with input parameters
-            record: Dict[str, Any] = dict(row)
+        # Decide worker count
+        if self.n_workers is None:
+            n_workers = min(os.cpu_count() or 1, len(jobs))
+        else:
+            n_workers = max(1, int(self.n_workers))
 
-            for sim in self.simulators:
-                inst = sim.instance
+        # Use "spawn" for safety (works on Linux too)
+        import multiprocessing as mp
 
-                # Set parameters on this instance
-                if self.param_mapping:
-                    for col_name, param_name in self.param_mapping.items():
-                        value = float(row[col_name])
-                        inst.set_parameter(param_name, value)
-                else:
-                    for col_name, value in row.items():
-                        inst.set_parameter(col_name, float(value))
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=n_workers, maxtasksperchild=self.maxtasksperchild) as pool:
+            outs = pool.map(_simulate_one, jobs)
 
-                # Run simulation
-                inst.run()
-
-                # Collect measures
-                for meas_name in self.measures:
-                    meas_value = inst.get_measure(meas_name)
-
-                    if len(self.simulators) == 1:
-                        col_name = meas_name
-                    else:
-                        col_name = f"{meas_name}_{sim.netlist_path.stem}"
-
-                    record[col_name] = meas_value
-
-            records.append(record)
-
-        result_df = pd.DataFrame.from_records(records)
-        return result_df
+        return pd.DataFrame(outs)

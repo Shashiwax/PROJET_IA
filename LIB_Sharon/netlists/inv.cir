@@ -1,20 +1,24 @@
-*CMOS inverter
-.include ~/PROJET_IA/LIB_Sharon/ciel/sky130A/libs.tech/ngspice/sky130copy.lib.spice 
-
+* CMOS inverter - Simulation pour optimisation RL
+.lib "/home/sharo/PROJET_IA/LIB_Sharon/ciel/sky130A/libs.tech/ngspice/sky130copy.lib.spice" tt
+*.lib "/home/sharo/PROJET_IA/LIB_Sharon/ciel/sky130A/libs.tech/ngspice/corners/tt.spice"
 ************************************************
-* Parameters (Python/RL can override these)
+* Parameters
 ************************************************
 .param vdd=1.80
 .param temp=25
-.param wn=0.42u
-.param wp=0.84u
-.param l =0.15u
+.param wn=650000u
+.param wp=1e+06u
+.param l =150000u
 .param cload=5f
 .param tr=50p
 .param tf=50p
 .param pw=1n
 .param per=2n
 .param tsim=6n
+
+* Constantes de la bibliothèque sky130_fd_sc_hd
+.param h_cell = 2.72u
+.param w_fixed = 0.46u
 
 .temp {temp}
 
@@ -25,14 +29,15 @@ VDD VP 0 {vdd}
 VIN A  0 PULSE(0 {vdd} 0 {tr} {tf} {pw} {per})
 
 ************************************************
-* DUT: parameterized inverter (Wn/Wp, L fixed)
+* DUT: parameterized inverter
 ************************************************
-.subckt inv_param A Y VP VN params: wn=0.42u wp=0.84u l=0.15u
-Mp0 Y A VP VP sky130_fd_pr__pfet_01v8 W={wp} L={l}
-Mn0 Y A VN VN sky130_fd_pr__nfet_01v8 W={wn} L={l}
+.subckt inv_param A VGND VNB VPB VPWR Y
+X0 VGND A Y VNB sky130_fd_pr__nfet_01v8 w={wn} l={l}
+X1 VPWR A Y VPB sky130_fd_pr__pfet_01v8_hvt w={wp} l={l}
 .ends inv_param
 
-XINV A Y VP 0 inv_param wn={wn} wp={wp} l={l}
+* Ordre des broches : A  VGND  VNB  VPB  VPWR  Y
+XINV A 0 0 VP VP Y inv_param
 
 ************************************************
 * Load
@@ -40,7 +45,7 @@ XINV A Y VP 0 inv_param wn={wn} wp={wp} l={l}
 CLOAD Y 0 {cload}
 
 ************************************************
-* Measurements (delay 20/80 + example static power)
+* Measurements & Characterization
 ************************************************
 .param rlow=0.2
 .param rhigh=0.8
@@ -49,15 +54,25 @@ CLOAD Y 0 {cload}
 
 .tran 1p {tsim}
 
-* Input rising -> output falling
+* 1. SURFACE (Area)
+.meas tran cell_area param='h_cell * (max(wn, wp) + w_fixed)'
+
+* 2. DELAIS (Transition delays)
 .meas tran delay_fall TRIG v(A) VAL={vhigh} RISE=1 TARG v(Y) VAL={vhigh} FALL=1
-* Input falling -> output rising
 .meas tran delay_rise TRIG v(A) VAL={vlow}  FALL=1 TARG v(Y) VAL={vlow}  RISE=1
 
-* Example static power averages in two stable windows (adapt if you change timings)
+* 3. CONSOMMATION STATIQUE (Static Power)
 .param t0a=0.2n t0b=0.8n
 .param t1a=1.2n t1b=1.8n
 .meas tran pstat_in0 AVG par('-(v(VP)*i(VDD) + v(A)*i(VIN))') FROM={t0a} TO={t0b}
 .meas tran pstat_in1 AVG par('-(v(VP)*i(VDD) + v(A)*i(VIN))') FROM={t1a} TO={t1b}
+
+* 4. CONSOMMATION DYNAMIQUE (Dynamic Energy)
+* Mesure de l'intégrale de la puissance totale entre deux points
+.meas tran etotal_trans INTEG par('-(v(VP)*i(VDD) + v(A)*i(VIN))') FROM=0.9n TO=1.1n
+
+* Calcul de l'énergie dynamique en soustrayant la part statique
+* Note : On utilise 'param' dans .meas pour combiner les résultats précédents
+.meas tran edyn_val param='etotal_trans - (pstat_in0 * 0.2n)'
 
 .end

@@ -16,9 +16,11 @@
 .param per=2n
 .param tsim=6n
 
-* Constantes de la bibliothèque sky130_fd_sc_hd
+* Constantes de la bibliothèque sky130_fd_sc_hd: https://skywater-pdk.readthedocs.io/en/main/contents/libraries/foundry-provided.html
+
 .param h_cell = 2.72u
-.param w_fixed = 0.46u
+.param pitch = 0.46u
+.param w_fixed = 0.16u
 
 .temp {temp}
 
@@ -55,7 +57,11 @@ CLOAD Y 0 {cload}
 .tran 1p {tsim}
 
 * 1. SURFACE (Area)
-.meas tran cell_area param='h_cell * (max(wn, wp) + w_fixed)'
+* --- Mesure de la Surface Réelle (en escalier) ---
+.meas tran cell_area param='h_cell * ceil((max(wn, wp) + w_fixed) / pitch) * pitch'
+
+* --- Mesure de la Surface Transistors (pour l'IA) ---
+.meas tran active_area param='(wn + wp) * 0.15u'
 
 * 2. DELAIS (Transition delays)
 .meas tran delay_fall TRIG v(A) VAL={vhigh} RISE=1 TARG v(Y) VAL={vhigh} FALL=1

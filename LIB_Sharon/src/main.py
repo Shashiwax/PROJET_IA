@@ -1,69 +1,63 @@
 from pathlib import Path
 from pyngs.core import NGSpiceInstance
-import time
 
-# 1. Chemin vers la netlist
 netlist_path = Path("/home/sharo/PROJET_IA/LIB_Sharon/netlists/inv.cir")
 inst = NGSpiceInstance()
 
-try:
-    print(f"Chargement de la netlist (Modèles Sky130A)...", flush=True)
-    inst.load(netlist_path)
-    print(f"Netlist chargée avec succès.", flush=True)
-
-    # 2. Simulation initiale (Caractérisation de base)
-    print("\n--- Simulation initiale en cours ---", flush=True)
-    inst.run()
-
-    # Extraction des specs initiales
-    specs_init = {
-        "Surface (cell_area)": inst.get_measure("cell_area"),
-        "Délai (delay_fall)": inst.get_measure("delay_fall"),
-        "Conso Statique": inst.get_measure("pstat_in1"),
-        "Énergie Dynamique": inst.get_measure("edyn_val")
+def extraire_toutes_specs(instance):
+    """Récupère l'ensemble des mesures définies dans la netlist."""
+    return {
+        "Surface (cell_area)": instance.get_measure("cell_area"),
+        "Délai (delay_fall)": instance.get_measure("delay_fall"),
+        "Conso Statique": instance.get_measure("pstat_in1"),
+        "Énergie Dynamique": instance.get_measure("edyn_val")
     }
 
-    for name, val in specs_init.items():
-        print(f"{name} : {val}", flush=True)
+def afficher_tableau(titre, specs, wn, wp):
+    """Affiche les résultats proprement."""
+    print(f"\n--- {titre} (wn={wn}, wp={wp}) ---")
+    for nom, val in specs.items():
+        # Formatage scientifique pour la lisibilité
+        print(f"  {nom:<20} : {val:.4e}")
+    print("-" * (len(titre) + 20))
 
-    # 3. MODIFICATION DES PARAMÈTRES
-    # On augmente la largeur du NMOS (wn)
-    new_wn = 0000000.8
-    print(f"\n[AGENT] Action : Modification de wn à {new_wn}", flush=True)
-    inst.set_parameter("wn", new_wn)
+try:
+    inst.load(netlist_path)
 
-    # 4. RÉ-EXÉCUTION DE LA SIMULATION (Étape cruciale)
-    # On reset et on relance pour que NGSpice recalcule les points de fonctionnement
+    # 1. ÉTAT INITIAL
+    inst.run()
+    wn_init = inst.get_parameter("wn")
+    wp_init = inst.get_parameter("wp")
+    specs_initiales = extraire_toutes_specs(inst)
+    
+    afficher_tableau("SPÉCIFICATIONS INITIALES", specs_initiales, wn_init, wp_init)
+
+    # 2. MODIFICATION (Exemple : Augmentation de la largeur du NMOS)
+    target_wn = 0.8  # On passe à 800nm
+    print(f"\n[AGENT] Action : Modification de wn de {wn_init} à {target_wn}...")
+    inst.set_parameter("wn", target_wn)
+
+    # 3. RELANCE DE LA SIMULATION
     try:
         inst.cmd("reset")
-    except AttributeError:
+    except:
         pass
-    
-    print("Relance de la simulation avec les nouveaux paramètres...", flush=True)
     inst.run()
 
-    # 5. EXTRACTION ET AFFICHAGE DES NOUVELLES SPECS
-    print("\n--- Caractéristiques mises à jour ---", flush=True)
-    
-    specs_updated = {
-        "Surface (cell_area)": inst.get_measure("cell_area"),
-        "Délai (delay_fall)": inst.get_measure("delay_fall"),
-        "Conso Statique": inst.get_measure("pstat_in1"),
-        "Énergie Dynamique": inst.get_measure("edyn_val")
-    }
+    # 4. ÉTAT FINAL ET COMPARAISON
+    specs_finales = extraire_toutes_specs(inst)
+    afficher_tableau("SPÉCIFICATIONS FINALES", specs_finales, target_wn, wp_init)
 
-    for key, value in specs_updated.items():
-        print(f"{key} : {value}", flush=True)
-    
-    print("--------------------------------------\n")
-
-    # Petit comparatif rapide pour le délai
-    diff = specs_init["Délai (delay_fall)"] - specs_updated["Délai (delay_fall)"]
-    print(f"Gain de rapidité constaté : {diff:.4e} s")
+    # 5. RÉSUMÉ DES VARIATIONS (%)
+    print("\n--- Analyse de l'impact ---")
+    for key in specs_initiales:
+        v_init = specs_initiales[key]
+        v_final = specs_finales[key]
+        if v_init != 0:
+            variation = ((v_final - v_init) / v_init) * 100
+            print(f"  {key:<20} : {variation:+.2f} %")
 
 except Exception as e:
-    print(f"\nErreur détectée : {e}", flush=True)
-
+    print(f"\nErreur : {e}")
 finally:
     inst.stop()
-    print("\nSimulateur arrêté.", flush=True)

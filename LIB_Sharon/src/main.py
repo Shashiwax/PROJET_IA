@@ -11,15 +11,28 @@ W_FIXED = 0.16     # Estimation des marges/contacts
 
 
 def get_all_metrics(instance):
+    pstat_in0_w = instance.get_measure("pstat_in0")
+    pstat_in1_w = instance.get_measure("pstat_in1")
+    pstat_vdd_in0_w = instance.get_measure("pstat_vdd_in0")
+    pstat_vdd_in1_w = instance.get_measure("pstat_vdd_in1")
+    pstat_wc_w = max(instance.get_measure("pstat_vdd_in0"), instance.get_measure("pstat_vdd_in1"))
     return {
         # On multiplie par 1e6 si tes unités SPICE sont déjà en "micros" 
         # ou 1e12 si elles sont en mètres.
-        "Surface Réelle (µm²)": instance.get_measure("cell_area") * 1e6, 
-        "Surface Transistors (µm²)": instance.get_measure("active_area") * 1e6,
+        "Surface Réelle (µm²)": instance.get_measure("cell_area"), #x1
+        "Surface Transistors (µm²)": instance.get_measure("active_area"), #x1
         "Délai Fall (ps)": instance.get_measure("delay_fall") * 1e12,
         "Délai Rise (ps)": instance.get_measure("delay_rise") * 1e12,
-        "Conso Statique (µW)": instance.get_measure("pstat_in1") * 1e6,
-        "Énergie Dyn (fJ)": instance.get_measure("edyn_val") * 1e15
+        # Total static power (VDD+VIN as defined in your .meas)
+        "Conso Statique IN1 (pW)": pstat_in1_w * 1e12,
+        "Conso Statique IN0 (µW)": pstat_in0_w * 1e6,
+
+        # VDD-only static power (cleaner for analysis/RL)
+        "Conso Statique VDD IN1 (pW)": pstat_vdd_in1_w * 1e12,
+        "Conso Statique VDD IN0 (µW)": pstat_vdd_in0_w * 1e6,
+        "Énergie Dyn (fJ)": instance.get_measure("edyn_val") * 1e15,
+        "Conso Statique WC (µW)": pstat_wc_w * 1e6
+
     }
 
 

@@ -18,9 +18,9 @@
 
 * Constantes de la bibliothèque sky130_fd_sc_hd: https://skywater-pdk.readthedocs.io/en/main/contents/libraries/foundry-provided.html
 
-.param h_cell = 2.72u
-.param pitch = 0.46u
-.param w_fixed = 0.16u
+.param h_cell = 2.72
+.param pitch = 0.46
+.param w_fixed = 0.16
 
 .temp {temp}
 
@@ -61,7 +61,7 @@ CLOAD Y 0 {cload}
 .meas tran cell_area param='h_cell * ceil((max(wn, wp) + w_fixed) / pitch) * pitch'
 
 * --- Mesure de la Surface Transistors (pour l'IA) ---
-.meas tran active_area param='(wn + wp) * 0.15u'
+.meas tran active_area param='(wn + wp) * 0.15'
 
 * 2. DELAIS (Transition delays)
 .meas tran delay_fall TRIG v(A) VAL={vhigh} RISE=1 TARG v(Y) VAL={vhigh} FALL=1
@@ -70,8 +70,15 @@ CLOAD Y 0 {cload}
 * 3. CONSOMMATION STATIQUE (Static Power)
 .param t0a=0.2n t0b=0.8n
 .param t1a=1.2n t1b=1.8n
-.meas tran pstat_in0 AVG par('-(v(VP)*i(VDD) + v(A)*i(VIN))') FROM={t0a} TO={t0b}
-.meas tran pstat_in1 AVG par('-(v(VP)*i(VDD) + v(A)*i(VIN))') FROM={t1a} TO={t1b}
+* A=1 (entrée haute) entre 0.2ns et 0.8ns
+.meas tran pstat_in1 AVG par('-(v(VP)*i(VDD) + v(A)*i(VIN))') FROM={t0a} TO={t0b}
+.meas tran pstat_vdd_in1 AVG par('-(v(VP)*i(VDD))') FROM={t0a} TO={t0b}
+
+* A=0 (entrée basse) entre 1.2ns et 1.8ns
+.meas tran pstat_in0 AVG par('-(v(VP)*i(VDD) + v(A)*i(VIN))') FROM={t1a} TO={t1b}
+.meas tran pstat_vdd_in0 AVG par('-(v(VP)*i(VDD))') FROM={t1a} TO={t1b}
+.meas tran ymean_A1 AVG v(Y) FROM={t0a} TO={t0b}
+.meas tran ymean_A0 AVG v(Y) FROM={t1a} TO={t1b}
 
 * 4. CONSOMMATION DYNAMIQUE (Dynamic Energy)
 * Mesure de l'intégrale de la puissance totale entre deux points

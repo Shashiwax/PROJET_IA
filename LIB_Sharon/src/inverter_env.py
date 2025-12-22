@@ -1,7 +1,8 @@
 # inverter_env.py
 # RL environment for a SKY130 inverter simulated with ngspice via pyngs.
-# This version forces the working directory to the netlist folder when loading/running,
-# which fixes "Error: circuit not parsed" when libraries use relative .include paths.
+# This version:
+#  - forces the working directory to the netlist folder when loading/running (fixes relative .include issues)
+#  - clamps metrics that should never be negative (fixes SB3 check_env bounds issues)
 
 from __future__ import annotations
 
@@ -148,7 +149,6 @@ class InverterEnv(gym.Env):
         )
 
     def _safe_reset_spice(self) -> None:
-        # Different pyngs builds expose reset differently.
         try:
             self.inst.cmd("reset")
             return
@@ -165,11 +165,10 @@ class InverterEnv(gym.Env):
         self.inst.set_parameter("wp", float(wp))
 
     def _read_metrics(self) -> Dict[str, float]:
-        # Raw units returned by ngspice:
-        # - delays: seconds
-        # - power: W
-        # - energy: J
-        # - areas: whatever your .meas defines (in your case: µm² already)
+        """
+        Reads .meas results and returns metrics in user-friendly units.
+        Also clamps any metric that should not be negative (for stable RL + env bounds).
+        """
         m: Dict[str, float] = {}
 
         def gm(name: str) -> float:
@@ -178,23 +177,27 @@ class InverterEnv(gym.Env):
                 raise RuntimeError(f"Missing .meas result: {name}")
             return float(val)
 
-        # Areas (already µm² in your current netlist)
-        m["cell_area_um2"] = gm("cell_area")
-        m["active_area_um2"] = gm("active_area")
+        # Areas (already µm² in your netlist)
+        m["cell_area_um2"] = max(0.0, gm("cell_area"))
+        m["active_area_um2"] = max(0.0, gm("active_area"))
 
         # Delays (s -> ps)
-        m["delay_fall_ps"] = gm("delay_fall") * 1e12
-        m["delay_rise_ps"] = gm("delay_rise") * 1e12
+        m["delay_fall_ps"] = max(0.0, gm("delay_fall") * 1e12)
+        m["delay_rise_ps"] = max(0.0, gm("delay_rise") * 1e12)
 
-        # Energy (J -> fJ)
-        m["edyn_fJ"] = gm("edyn_val") * 1e15
+        # Energy (J -> fJ), clamp to 0 (edyn_val can go negative due to baseline subtraction)
+        edyn_fJ = gm("edyn_val") * 1e15
+        m["edyn_fJ"] = max(0.0, edyn_fJ)
 
-        # Static power (W -> µW/pW)
+        # Static power on VDD
         p_vdd_in0_w = gm("pstat_vdd_in0")
         p_vdd_in1_w = gm("pstat_vdd_in1")
-        m["pstat_vdd_in0_uW"] = p_vdd_in0_w * 1e6
-        m["pstat_vdd_in1_pW"] = p_vdd_in1_w * 1e12
-        m["pstat_wc_uW"] = max(p_vdd_in0_w, p_vdd_in1_w) * 1e6
+
+        m["pstat_vdd_in0_uW"] = max(0.0, p_vdd_in0_w * 1e6)
+        m["pstat_vdd_in1_pW"] = max(0.0, p_vdd_in1_w * 1e12)
+
+        # Worst-case static power (µW)
+        m["pstat_wc_uW"] = max(0.0, max(p_vdd_in0_w, p_vdd_in1_w) * 1e6)
 
         return m
 
@@ -214,19 +217,16 @@ class InverterEnv(gym.Env):
         )
 
     def _compute_reward(self, metrics: Dict[str, float]) -> float:
-        # Single timing cost: worst of rise/fall
         delay_ps = max(metrics["delay_rise_ps"], metrics["delay_fall_ps"])
         area_um2 = metrics["cell_area_um2"]
         edyn_fJ = metrics["edyn_fJ"]
         pstat_wc_uW = metrics["pstat_wc_uW"]
 
-        # Normalize (avoid division by zero)
         area_n = area_um2 / max(self.n.area_um2, 1e-12)
         delay_n = delay_ps / max(self.n.delay_ps, 1e-12)
         edyn_n = edyn_fJ / max(self.n.edyn_fj, 1e-12)
         pstat_n = pstat_wc_uW / max(self.n.pstat_uw, 1e-12)
 
-        # Reward = -weighted cost
         return -float(
             self.w.w_area * area_n
             + self.w.w_delay * delay_n
@@ -243,7 +243,6 @@ class InverterEnv(gym.Env):
         super().reset(seed=seed)
         self._step_count = 0
 
-        # Choose initial parameters
         if self.random_reset:
             wn = float(self._np_random.uniform(self.wn_min, self.wn_max))
             wp = float(self._np_random.uniform(self.wp_min, self.wp_max))
@@ -265,7 +264,6 @@ class InverterEnv(gym.Env):
             return obs, {"metrics": metrics}
 
         except Exception as e:
-            # Fail-safe reset: return zeros + error info
             obs = np.zeros((8,), dtype=np.float32)
             return obs, {"metrics": {"error": str(e), "where": "reset"}}
 
@@ -293,7 +291,6 @@ class InverterEnv(gym.Env):
             return obs, reward, terminated, truncated, info
 
         except Exception as e:
-            # Hard failure: big penalty, stop the episode
             obs = np.zeros((8,), dtype=np.float32)
             reward = -1e6
             terminated = True

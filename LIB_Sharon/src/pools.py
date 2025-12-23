@@ -2,16 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-
+from typing import Any, Dict, Iterable, List, Optional
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 
 import pandas as pd
 
+
+# -----------------------------
+# Parsing helpers
+# -----------------------------
 
 _MEAS_LINE_RE = re.compile(
     r"^\s*([A-Za-z_]\w*)\s*=\s*([+-]?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)"
@@ -20,28 +22,25 @@ _MEAS_LINE_RE = re.compile(
 
 def _infer_spice_cwd_from_netlist_text(netlist_text: str) -> Optional[Path]:
     """
-    Infer the best ngspice working directory from the first .lib "path" line.
-    This is critical for relative .include inside the sky130 model library.
+    Infer ngspice working directory from the first .lib "path" line.
+    This matters because sky130 model libraries often use relative .include paths.
     """
-    # Example: .lib "/abs/path/.../sky130copy.lib.spice" tt
     lib_re = re.compile(r'^\s*\.lib\s+"([^"]+)"', re.IGNORECASE | re.MULTILINE)
     m = lib_re.search(netlist_text)
     if not m:
         return None
     lib_path = Path(m.group(1)).expanduser()
-    return lib_path.parent if lib_path.exists() else lib_path.parent
+    return lib_path.parent
 
 
 def _rewrite_params_in_netlist(netlist_text: str, params: Dict[str, float]) -> str:
     """
     Replace .param <name>=... occurrences for the given params.
-    Assumes params like wn/wp are defined as individual .param lines.
+    If not found, append a new .param at the end (last definition wins).
     """
     out = netlist_text
 
     for name, val in params.items():
-        # Replace lines like: .param wn=650000u   OR   .param wn = 0.65
-        # Keep the rest of the line unchanged.
         pattern = re.compile(
             rf"(^\s*\.param\s+{re.escape(name)}\s*=\s*)([^\s]+)",
             re.IGNORECASE | re.MULTILINE,
@@ -49,25 +48,19 @@ def _rewrite_params_in_netlist(netlist_text: str, params: Dict[str, float]) -> s
         repl = rf"\g<1>{val:.6g}"
         out, n = pattern.subn(repl, out, count=1)
         if n == 0:
-            # If not found, append a new definition (last definition wins in SPICE).
             out += f"\n.param {name}={val:.6g}\n"
 
     return out
 
 
-def _run_ngspice_batch(
-    netlist_path: Path,
-    spice_cwd: Optional[Path],
-    timeout_s: float,
-) -> str:
+def _run_ngspice_batch(netlist_path: Path, spice_cwd: Optional[Path], timeout_s: float) -> str:
     """
-    Run ngspice in batch mode and return stdout+stderr text.
+    Run ngspice in batch mode and return stdout+stderr.
     """
     cmd = ["ngspice", "-b", str(netlist_path)]
     cwd = str(spice_cwd) if spice_cwd is not None else None
 
     env = os.environ.copy()
-    # Avoid GUI / interactive behaviors
     env.setdefault("NGSPICE_ASCIIRAWFILE", "1")
 
     p = subprocess.run(
@@ -87,7 +80,7 @@ def _run_ngspice_batch(
 
 def _parse_measures_from_ngspice_output(output_text: str) -> Dict[str, float]:
     """
-    Parse the 'name = value' lines printed by ngspice for .meas results.
+    Parse 'name = value' lines printed by ngspice for .meas results.
     Works even if the line has extra tokens like 'targ=' and 'trig='.
     """
     measures: Dict[str, float] = {}
@@ -101,32 +94,122 @@ def _parse_measures_from_ngspice_output(output_text: str) -> Dict[str, float]:
     return measures
 
 
+# -----------------------------
+# Reward (Pool <-> RL alignment)
+# -----------------------------
+
+@dataclass(frozen=True)
+class RewardConfig:
+    """
+    Keep this consistent with the reward used in your RL env.
+    Defaults are your 'initial' reference point.
+    """
+    ref_cell_area_um2: float = 3.7536
+    ref_delay_sum_ps: float = 5.000321 + 18.96081
+    ref_pstat_wc_uW: float = 1.295751
+    ref_edyn_fJ: float = 1.96807
+
+    w_area: float = 0.25
+    w_delay: float = 0.45
+    w_pstat: float = 0.20
+    w_edyn: float = 0.10
+
+    fail_reward: float = -1e6
+
+
+def _postprocess_robot_metrics(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert raw ngspice measures to robot-friendly units:
+      - um^2, ps, uW, fJ
+    Also compute pstat_wc_uW (worst-case static power from VDD).
+    """
+    out: Dict[str, Any] = dict(raw)
+
+    # Areas: in your setup these are already in um^2 (as observed in ngspice output)
+    if "cell_area" in out:
+        out["cell_area_um2"] = float(out["cell_area"])
+    if "active_area" in out:
+        out["active_area_um2"] = float(out["active_area"])
+
+    # Delays: seconds -> ps
+    if "delay_fall" in out:
+        out["delay_fall_ps"] = float(out["delay_fall"]) * 1e12
+    if "delay_rise" in out:
+        out["delay_rise_ps"] = float(out["delay_rise"]) * 1e12
+
+    # Energy: Joules -> fJ
+    if "edyn_val" in out:
+        out["edyn_fJ"] = float(out["edyn_val"]) * 1e15
+
+    # Static power from VDD: Watts -> uW
+    if "pstat_vdd_in0" in out:
+        out["pstat_vdd_in0_uW"] = float(out["pstat_vdd_in0"]) * 1e6
+    if "pstat_vdd_in1" in out:
+        out["pstat_vdd_in1_uW"] = float(out["pstat_vdd_in1"]) * 1e6
+
+    # Worst-case static
+    if "pstat_vdd_in0_uW" in out and "pstat_vdd_in1_uW" in out:
+        out["pstat_wc_uW"] = max(float(out["pstat_vdd_in0_uW"]), float(out["pstat_vdd_in1_uW"]))
+    elif "pstat_vdd_in0_uW" in out:
+        out["pstat_wc_uW"] = float(out["pstat_vdd_in0_uW"])
+    elif "pstat_vdd_in1_uW" in out:
+        out["pstat_wc_uW"] = float(out["pstat_vdd_in1_uW"])
+
+    return out
+
+
+def _compute_reward(metrics: Dict[str, Any], cfg: RewardConfig) -> float:
+    """
+    Normalized weighted cost -> reward = -cost.
+    """
+    if "error" in metrics and metrics["error"]:
+        return cfg.fail_reward
+
+    required = ["cell_area_um2", "delay_fall_ps", "delay_rise_ps", "pstat_wc_uW", "edyn_fJ"]
+    if any(k not in metrics for k in required):
+        return cfg.fail_reward
+
+    area = float(metrics["cell_area_um2"])
+    delay_sum = float(metrics["delay_fall_ps"]) + float(metrics["delay_rise_ps"])
+    pstat_wc = float(metrics["pstat_wc_uW"])
+    edyn = float(metrics["edyn_fJ"])
+
+    c_area = area / (cfg.ref_cell_area_um2 + 1e-12)
+    c_delay = delay_sum / (cfg.ref_delay_sum_ps + 1e-12)
+    c_pstat = pstat_wc / (cfg.ref_pstat_wc_uW + 1e-12)
+    c_edyn = edyn / (cfg.ref_edyn_fJ + 1e-12)
+
+    cost = cfg.w_area * c_area + cfg.w_delay * c_delay + cfg.w_pstat * c_pstat + cfg.w_edyn * c_edyn
+    return -float(cost)
+
+
+# -----------------------------
+# Single simulation job
+# -----------------------------
+
 @dataclass(frozen=True)
 class SimJob:
     netlist_template: Path
     params: Dict[str, float]
 
 
-def _simulate_one_job(
-    job: SimJob,
-    timeout_s: float,
-    spice_cwd: Optional[Path],
-) -> Dict[str, Any]:
+def _simulate_one_job(job: SimJob, timeout_s: float, spice_cwd: Optional[Path]) -> Dict[str, Any]:
     """
-    Worker-safe single simulation: copy netlist to temp, rewrite params, run ngspice, parse measures.
-    Returns a dict of measures + potential 'error'.
+    Worker-safe single simulation:
+      - copy netlist to a temp folder
+      - rewrite params
+      - run ngspice
+      - parse measures
     """
-    netlist_template = job.netlist_template
-
     try:
-        template_text = netlist_template.read_text()
+        template_text = job.netlist_template.read_text()
 
         inferred_cwd = _infer_spice_cwd_from_netlist_text(template_text)
         effective_cwd = spice_cwd if spice_cwd is not None else inferred_cwd
 
         with tempfile.TemporaryDirectory(prefix="spice_job_") as td:
             td_path = Path(td)
-            work_netlist = td_path / netlist_template.name
+            work_netlist = td_path / job.netlist_template.name
 
             rewritten = _rewrite_params_in_netlist(template_text, job.params)
             work_netlist.write_text(rewritten)
@@ -134,21 +217,23 @@ def _simulate_one_job(
             out = _run_ngspice_batch(work_netlist, effective_cwd, timeout_s)
             meas = _parse_measures_from_ngspice_output(out)
 
-        # Always echo back the params used (useful for debugging)
-        meas_out: Dict[str, Any] = dict(meas)
+        # Echo the actual params used (useful for the robot)
         for k, v in job.params.items():
-            meas_out[f"{k}_in"] = float(v)
+            meas[f"{k}_in"] = float(v)
 
-        return meas_out
+        return meas
 
     except Exception as e:
         return {"error": str(e), **{f"{k}_in": float(v) for k, v in job.params.items()}}
 
 
+# -----------------------------
+# Pool classes
+# -----------------------------
+
 class SequentialPool:
     """
-    Sequential simulation pool (spec: __init__(netlists), run(values)->DataFrame).
-    Runs simulations one by one. :contentReference[oaicite:2]{index=2}
+    Runs simulations one by one: run(DataFrame)->DataFrame.
     """
 
     def __init__(
@@ -157,6 +242,8 @@ class SequentialPool:
         *,
         timeout_s: float = 20.0,
         spice_cwd: Optional[str | Path] = None,
+        reward_cfg: Optional[RewardConfig] = None,
+        keep_raw: bool = False,
     ) -> None:
         self.netlists = [Path(n).expanduser().resolve() for n in netlists]
         if len(self.netlists) == 0:
@@ -164,30 +251,31 @@ class SequentialPool:
 
         self.timeout_s = float(timeout_s)
         self.spice_cwd = Path(spice_cwd).expanduser().resolve() if spice_cwd else None
+        self.reward_cfg = reward_cfg or RewardConfig()
+        self.keep_raw = bool(keep_raw)
 
     def run(self, values: pd.DataFrame) -> pd.DataFrame:
-        """
-        values: DataFrame with columns matching the SPICE .param names (e.g. wn, wp).
-        returns: DataFrame with parsed measures (one row per input row). :contentReference[oaicite:3]{index=3}
-        """
         results: List[Dict[str, Any]] = []
-
-        # Use round-robin netlist templates (useful when you have duplicates inv1.cir inv2.cir...)
         n_templates = len(self.netlists)
 
         for i, row in values.iterrows():
             params = {k: float(row[k]) for k in values.columns}
             tpl = self.netlists[i % n_templates]
             job = SimJob(netlist_template=tpl, params=params)
-            res = _simulate_one_job(job, timeout_s=self.timeout_s, spice_cwd=self.spice_cwd)
-            results.append(res)
 
-        return pd.DataFrame(results)
+            raw = _simulate_one_job(job, self.timeout_s, self.spice_cwd)
+            met = _postprocess_robot_metrics(raw)
+            met["reward"] = _compute_reward(met, self.reward_cfg)
+
+            results.append(met)
+
+        df = pd.DataFrame(results)
+        return df if self.keep_raw else _select_robot_columns(df)
 
 
 class ParallelPool:
     """
-    Parallel simulation pool (spec: __init__(netlists), run(values)->DataFrame). :contentReference[oaicite:4]{index=4}
+    Runs simulations in parallel using multiple processes: run(DataFrame)->DataFrame.
     """
 
     def __init__(
@@ -197,6 +285,8 @@ class ParallelPool:
         n_workers: Optional[int] = None,
         timeout_s: float = 20.0,
         spice_cwd: Optional[str | Path] = None,
+        reward_cfg: Optional[RewardConfig] = None,
+        keep_raw: bool = False,
     ) -> None:
         self.netlists = [Path(n).expanduser().resolve() for n in netlists]
         if len(self.netlists) == 0:
@@ -204,17 +294,14 @@ class ParallelPool:
 
         self.timeout_s = float(timeout_s)
         self.spice_cwd = Path(spice_cwd).expanduser().resolve() if spice_cwd else None
+        self.reward_cfg = reward_cfg or RewardConfig()
+        self.keep_raw = bool(keep_raw)
 
-        # Default: number of workers = number of netlists (as suggested by the spec idea of duplicating netlists)
         self.n_workers = int(n_workers) if n_workers is not None else len(self.netlists)
         if self.n_workers <= 0:
             raise ValueError("n_workers must be >= 1")
 
     def run(self, values: pd.DataFrame) -> pd.DataFrame:
-        """
-        values: DataFrame with columns matching SPICE .param names (wn, wp, ...). :contentReference[oaicite:5]{index=5}
-        returns: DataFrame of measures (one row per input row).
-        """
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
         jobs: List[SimJob] = []
@@ -232,8 +319,35 @@ class ParallelPool:
                 ex.submit(_simulate_one_job, job, self.timeout_s, self.spice_cwd): idx
                 for idx, job in enumerate(jobs)
             }
+
             for fut in as_completed(future_map):
                 idx = future_map[fut]
-                results[idx] = fut.result()
+                raw = fut.result()
+                met = _postprocess_robot_metrics(raw)
+                met["reward"] = _compute_reward(met, self.reward_cfg)
+                results[idx] = met
 
-        return pd.DataFrame(results)
+        df = pd.DataFrame(results)
+        return df if self.keep_raw else _select_robot_columns(df)
+
+
+def _select_robot_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keep only the columns that matter for the 'robot' + minimal debugging.
+    """
+    cols = [
+        "wn_in",
+        "wp_in",
+        "cell_area_um2",
+        "active_area_um2",
+        "delay_fall_ps",
+        "delay_rise_ps",
+        "edyn_fJ",
+        "pstat_wc_uW",
+        "pstat_vdd_in0_uW",
+        "pstat_vdd_in1_uW",
+        "reward",
+        "error",
+    ]
+    keep = [c for c in cols if c in df.columns]
+    return df[keep].copy()

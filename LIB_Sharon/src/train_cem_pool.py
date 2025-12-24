@@ -6,36 +6,60 @@ from pools import ParallelPool, RewardConfig
 
 
 def _clamp(x: np.ndarray, lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
-    """
-    Clamp each dimension of x to [lo, hi].
-    """
     return np.minimum(np.maximum(x, lo), hi)
 
 
+def _snap_to_bins(x: np.ndarray, bins: np.ndarray) -> np.ndarray:
+    """
+    Snap each element of x to the nearest value in bins.
+    """
+    # x: (N,)
+    # bins: (M,)
+    idx = np.abs(x[:, None] - bins[None, :]).argmin(axis=1)
+    return bins[idx]
+
+
 def main() -> None:
-    # --- Netlist ---
     netlist = Path("/home/sharo/PROJET_IA/LIB_Sharon/netlists/inv.cir")
 
-    # --- Action bounds (match what you want for design search) ---
-    wn_min, wn_max = 0.36, 0.65
-    wp_min, wp_max = 0.36, 1.00
+    # PDK-friendly width bins (subset up to 2.0um; edit if you want a different range)
+    # English-only comments as requested.
+    W_BINS = np.array(
+        [
+            0.36, 0.39, 0.42,
+            0.52, 0.54, 0.55, 0.58, 0.60, 0.61, 0.63, 0.64, 0.65,
+            0.70, 0.74, 0.75, 0.84,
+            1.00, 1.12, 1.26, 1.65, 1.68,
+            2.00,
+        ],
+        dtype=np.float32,
+    )
+
+    # Search bounds (continuous sampling is clamped, then snapped to bins)
+    wn_min, wn_max = 0.36, 2.00
+    wp_min, wp_max = 0.36, 2.00
     lo = np.array([wn_min, wp_min], dtype=np.float32)
     hi = np.array([wn_max, wp_max], dtype=np.float32)
 
-    # --- Reward config (must match the reward logic you want) ---
+    # Reward config: baseline + weights + hard logic thresholds (0.95/0.05)
     cfg = RewardConfig(
-        w_area=0.25,
-        w_delay=0.45,
-        w_pstat=0.20,
-        w_edyn=0.10,
-        # Keep the reference point = your "baseline" (defaults are OK if your baseline is the initial cell)
         ref_cell_area_um2=3.7536,
-        ref_delay_sum_ps=(5.000321 + 18.96081),
+        ref_delay_max_ps=18.96081,
         ref_pstat_wc_uW=1.295751,
         ref_edyn_fJ=1.96807,
+        w_area=0.25,
+        w_delay=0.35,
+        w_pstat=0.25,
+        w_edyn=0.15,
+        w_size=0.02,
+        wn0=0.65,
+        wp0=1.0,
+        vdd=1.8,
+        yhi_ratio=0.95,
+        ylo_ratio=0.05,
+        fail_reward=-1e6,
     )
 
-    # --- Pool ---
     pool = ParallelPool(
         [netlist],
         n_workers=2,
@@ -44,17 +68,17 @@ def main() -> None:
         keep_raw=False,
     )
 
-    # --- CEM hyperparameters (batch RL / policy search) ---
     rng = np.random.default_rng(0)
 
-    n_iters = 15
-    batch_size = 32
+    # CEM hyperparameters
+    n_iters = 20
+    batch_size = 48
     elite_frac = 0.25
     alpha = 0.7
 
-    # --- Policy distribution: Gaussian over [wn, wp] ---
-    mean = np.array([0.55, 0.80], dtype=np.float32)
-    std = np.array([0.10, 0.15], dtype=np.float32)
+    # Policy distribution over (wn, wp)
+    mean = np.array([0.65, 1.00], dtype=np.float32)
+    std = np.array([0.30, 0.35], dtype=np.float32)
 
     best_reward = -1e18
     best_wn = None
@@ -63,35 +87,43 @@ def main() -> None:
     history = []
 
     for it in range(1, n_iters + 1):
-        # Sample a batch from the current policy
+        # Sample continuous
         samples = rng.standard_normal(size=(batch_size, 2), dtype=np.float32) * std + mean
         samples = _clamp(samples, lo, hi)
 
-        values = pd.DataFrame({"wn": samples[:, 0], "wp": samples[:, 1]})
+        # Snap to PDK bins
+        wn = _snap_to_bins(samples[:, 0], W_BINS)
+        wp = _snap_to_bins(samples[:, 1], W_BINS)
+
+        values = pd.DataFrame({"wn": wn, "wp": wp})
         df = pool.run(values)
 
-        # Filter failed sims (if any)
+        # Filter failures
         if "error" in df.columns:
             ok = df["error"].isna() | (df["error"] == "")
             df_ok = df[ok].copy()
         else:
             df_ok = df.copy()
 
+        # Also drop hard-constraint failures (reward = fail_reward)
+        df_ok = df_ok[df_ok["reward"] > cfg.fail_reward / 10].copy()
+
         if len(df_ok) == 0:
-            print(f"[iter {it:02d}] all simulations failed -> skipping update")
+            print(f"[iter {it:02d}] all candidates failed -> widening std slightly")
+            std = np.minimum(std * 1.10, np.array([0.60, 0.80], dtype=np.float32))
             continue
 
         # Sort by reward (descending)
         df_ok = df_ok.sort_values("reward", ascending=False).reset_index(drop=True)
+        top = df_ok.iloc[0]
 
         # Track best so far
-        top = df_ok.iloc[0]
         if float(top["reward"]) > best_reward:
             best_reward = float(top["reward"])
             best_wn = float(top["wn_in"])
             best_wp = float(top["wp_in"])
 
-        # Select elites
+        # Elite selection
         n_elite = max(2, int(elite_frac * len(df_ok)))
         elites = df_ok.head(n_elite)
         elite_actions = elites[["wn_in", "wp_in"]].to_numpy(dtype=np.float32)
@@ -99,7 +131,7 @@ def main() -> None:
         elite_mean = elite_actions.mean(axis=0)
         elite_std = elite_actions.std(axis=0) + 1e-6
 
-        # Smooth update (policy improvement)
+        # Smooth update
         mean = (1 - alpha) * mean + alpha * elite_mean
         std = (1 - alpha) * std + alpha * elite_std
 
@@ -127,7 +159,6 @@ def main() -> None:
             }
         )
 
-    # Save training trace
     hist_df = pd.DataFrame(history)
     hist_df.to_csv("cem_history.csv", index=False)
 
@@ -135,7 +166,6 @@ def main() -> None:
     print({"reward": best_reward, "wn": best_wn, "wp": best_wp})
     print("Saved: cem_history.csv")
 
-    # Re-evaluate best (one clean sim) without creating another file
     if best_wn is not None and best_wp is not None:
         df_best = pool.run(pd.DataFrame({"wn": [best_wn], "wp": [best_wp]}))
         print("\n=== BEST POINT METRICS ===")

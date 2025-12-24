@@ -23,7 +23,7 @@ _MEAS_LINE_RE = re.compile(
 def _infer_spice_cwd_from_netlist_text(netlist_text: str) -> Optional[Path]:
     """
     Infer ngspice working directory from the first .lib "path" line.
-    This matters because sky130 model libraries often use relative .include paths.
+    This matters because model libraries often use relative .include paths.
     """
     lib_re = re.compile(r'^\s*\.lib\s+"([^"]+)"', re.IGNORECASE | re.MULTILINE)
     m = lib_re.search(netlist_text)
@@ -95,24 +95,36 @@ def _parse_measures_from_ngspice_output(output_text: str) -> Dict[str, float]:
 
 
 # -----------------------------
-# Reward (Pool <-> RL alignment)
+# Reward config + reward logic
 # -----------------------------
 
 @dataclass(frozen=True)
 class RewardConfig:
     """
-    Keep this consistent with the reward used in your RL env.
-    Defaults are your 'initial' reference point.
+    Keep this consistent between Pool+CEM and SB3 env (later).
+    Defaults assume your baseline is wn0=0.65 wp0=1.0 at VDD=1.8V.
     """
+    # Baseline reference (normalized ratios)
     ref_cell_area_um2: float = 3.7536
-    ref_delay_sum_ps: float = 5.000321 + 18.96081
+    ref_delay_max_ps: float = 18.96081
     ref_pstat_wc_uW: float = 1.295751
     ref_edyn_fJ: float = 1.96807
 
-    w_area: float = 0.25
-    w_delay: float = 0.45
-    w_pstat: float = 0.20
-    w_edyn: float = 0.10
+    # Weights for the 4 specs
+    w_area: float = 0.35
+    w_delay: float = 0.35
+    w_pstat: float = 0.25
+    w_edyn: float = 0.25
+
+    # Soft size regularizer (penalize only above baseline)
+    w_size: float = 0.1
+    wn0: float = 0.65
+    wp0: float = 1.0
+
+    # Logic constraints on ymean (hard)
+    vdd: float = 1.8
+    yhi_ratio: float = 0.95
+    ylo_ratio: float = 0.05
 
     fail_reward: float = -1e6
 
@@ -120,34 +132,41 @@ class RewardConfig:
 def _postprocess_robot_metrics(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     Convert raw ngspice measures to robot-friendly units:
-      - um^2, ps, uW, fJ
-    Also compute pstat_wc_uW (worst-case static power from VDD).
+      - area: um^2 (already in your netlist)
+      - delay: s -> ps
+      - power: W -> uW
+      - energy: J -> fJ
+    Also compute:
+      - delay_max_ps
+      - pstat_wc_uW
     """
     out: Dict[str, Any] = dict(raw)
 
-    # Areas: in your setup these are already in um^2 (as observed in ngspice output)
+    # Areas (already in um^2 in your measurement expressions)
     if "cell_area" in out:
         out["cell_area_um2"] = float(out["cell_area"])
     if "active_area" in out:
         out["active_area_um2"] = float(out["active_area"])
 
-    # Delays: seconds -> ps
+    # Delays (s -> ps)
     if "delay_fall" in out:
         out["delay_fall_ps"] = float(out["delay_fall"]) * 1e12
     if "delay_rise" in out:
         out["delay_rise_ps"] = float(out["delay_rise"]) * 1e12
+    if "delay_fall_ps" in out and "delay_rise_ps" in out:
+        out["delay_max_ps"] = max(float(out["delay_fall_ps"]), float(out["delay_rise_ps"]))
 
-    # Energy: Joules -> fJ
+    # Energy (J -> fJ)
     if "edyn_val" in out:
         out["edyn_fJ"] = float(out["edyn_val"]) * 1e15
 
-    # Static power from VDD: Watts -> uW
+    # Static power from VDD (W -> uW)
     if "pstat_vdd_in0" in out:
         out["pstat_vdd_in0_uW"] = float(out["pstat_vdd_in0"]) * 1e6
     if "pstat_vdd_in1" in out:
         out["pstat_vdd_in1_uW"] = float(out["pstat_vdd_in1"]) * 1e6
 
-    # Worst-case static
+    # Worst-case static power
     if "pstat_vdd_in0_uW" in out and "pstat_vdd_in1_uW" in out:
         out["pstat_wc_uW"] = max(float(out["pstat_vdd_in0_uW"]), float(out["pstat_vdd_in1_uW"]))
     elif "pstat_vdd_in0_uW" in out:
@@ -155,32 +174,57 @@ def _postprocess_robot_metrics(raw: Dict[str, Any]) -> Dict[str, Any]:
     elif "pstat_vdd_in1_uW" in out:
         out["pstat_wc_uW"] = float(out["pstat_vdd_in1_uW"])
 
+    # Keep ymean as-is (Volts)
+    # Expected measures: ymean_a0, ymean_a1
+
     return out
 
 
 def _compute_reward(metrics: Dict[str, Any], cfg: RewardConfig) -> float:
     """
-    Normalized weighted cost -> reward = -cost.
+    Reward = -(weighted normalized cost + size_regularizer)
+    Hard constraints:
+      - ymean_a0 >= 0.95*VDD
+      - ymean_a1 <= 0.05*VDD
+    Delay metric:
+      - D = delay_max_ps = max(delay_rise_ps, delay_fall_ps)
     """
     if "error" in metrics and metrics["error"]:
         return cfg.fail_reward
 
-    required = ["cell_area_um2", "delay_fall_ps", "delay_rise_ps", "pstat_wc_uW", "edyn_fJ"]
+    required = ["cell_area_um2", "delay_max_ps", "pstat_wc_uW", "edyn_fJ", "ymean_a0", "ymean_a1", "wn_in", "wp_in"]
     if any(k not in metrics for k in required):
         return cfg.fail_reward
 
+    # Hard logic constraints
+    ymean_a0 = float(metrics["ymean_a0"])
+    ymean_a1 = float(metrics["ymean_a1"])
+    y_hi = cfg.yhi_ratio * cfg.vdd
+    y_lo = cfg.ylo_ratio * cfg.vdd
+    if ymean_a0 < y_hi or ymean_a1 > y_lo:
+        return cfg.fail_reward
+
+    # Normalized costs (ratios)
     area = float(metrics["cell_area_um2"])
-    delay_sum = float(metrics["delay_fall_ps"]) + float(metrics["delay_rise_ps"])
-    pstat_wc = float(metrics["pstat_wc_uW"])
+    dmax = float(metrics["delay_max_ps"])
+    pstat = float(metrics["pstat_wc_uW"])
     edyn = float(metrics["edyn_fJ"])
 
-    c_area = area / (cfg.ref_cell_area_um2 + 1e-12)
-    c_delay = delay_sum / (cfg.ref_delay_sum_ps + 1e-12)
-    c_pstat = pstat_wc / (cfg.ref_pstat_wc_uW + 1e-12)
-    c_edyn = edyn / (cfg.ref_edyn_fJ + 1e-12)
+    a = area / (cfg.ref_cell_area_um2 + 1e-12)
+    d = dmax / (cfg.ref_delay_max_ps + 1e-12)
+    p = pstat / (cfg.ref_pstat_wc_uW + 1e-12)
+    e = edyn / (cfg.ref_edyn_fJ + 1e-12)
 
-    cost = cfg.w_area * c_area + cfg.w_delay * c_delay + cfg.w_pstat * c_pstat + cfg.w_edyn * c_edyn
-    return -float(cost)
+    base_cost = cfg.w_area * a + cfg.w_delay * d + cfg.w_pstat * p + cfg.w_edyn * e
+
+    # Soft size regularizer (only above baseline)
+    wn = float(metrics["wn_in"])
+    wp = float(metrics["wp_in"])
+    dw = max(0.0, wn / (cfg.wn0 + 1e-12) - 1.0)
+    dp = max(0.0, wp / (cfg.wp0 + 1e-12) - 1.0)
+    size_cost = cfg.w_size * (dw * dw + dp * dp)
+
+    return -(base_cost + size_cost)
 
 
 # -----------------------------
@@ -217,7 +261,7 @@ def _simulate_one_job(job: SimJob, timeout_s: float, spice_cwd: Optional[Path]) 
             out = _run_ngspice_batch(work_netlist, effective_cwd, timeout_s)
             meas = _parse_measures_from_ngspice_output(out)
 
-        # Echo the actual params used (useful for the robot)
+        # Echo the actual params used
         for k, v in job.params.items():
             meas[f"{k}_in"] = float(v)
 
@@ -333,7 +377,7 @@ class ParallelPool:
 
 def _select_robot_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Keep only the columns that matter for the 'robot' + minimal debugging.
+    Keep only the columns that matter for the robot + minimal debugging.
     """
     cols = [
         "wn_in",
@@ -342,10 +386,13 @@ def _select_robot_columns(df: pd.DataFrame) -> pd.DataFrame:
         "active_area_um2",
         "delay_fall_ps",
         "delay_rise_ps",
+        "delay_max_ps",
         "edyn_fJ",
         "pstat_wc_uW",
         "pstat_vdd_in0_uW",
         "pstat_vdd_in1_uW",
+        "ymean_a0",
+        "ymean_a1",
         "reward",
         "error",
     ]

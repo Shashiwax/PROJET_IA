@@ -112,9 +112,9 @@ class RewardConfig:
 
     # Weights for the 4 specs
     w_area: float = 0.35
-    w_delay: float = 0.35
+    w_delay: float = 0.25
     w_pstat: float = 0.25
-    w_edyn: float = 0.25
+    w_edyn: float = 0.15
 
     # Soft size regularizer (penalize only above baseline)
     w_size: float = 0.1

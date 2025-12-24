@@ -42,24 +42,14 @@ def main() -> None:
     hi = np.array([wn_max, wp_max], dtype=np.float32)
 
     # Reward config: baseline + weights + hard logic thresholds (0.95/0.05)
-    cfg = RewardConfig(
-        ref_cell_area_um2=3.7536,
-        ref_delay_max_ps=18.96081,
-        ref_pstat_wc_uW=1.295751,
-        ref_edyn_fJ=1.96807,
-        w_area=0.25,
-        w_delay=0.35,
-        w_pstat=0.25,
-        w_edyn=0.15,
-        w_size=0.02,
-        wn0=0.65,
-        wp0=1.0,
-        vdd=1.8,
-        yhi_ratio=0.95,
-        ylo_ratio=0.05,
-        fail_reward=-1e6,
-    )
+    cfg = RewardConfig()
+    print("w_area",cfg.w_area)
+    print("w_delay",cfg.w_delay)
+    print("w_pstat",cfg.w_pstat)
+    print("edyn",cfg.w_edyn)
+    print("w_size",cfg.w_size)
 
+    
     pool = ParallelPool(
         [netlist],
         n_workers=2,
@@ -71,10 +61,10 @@ def main() -> None:
     rng = np.random.default_rng(0)
 
     # CEM hyperparameters
-    n_iters = 20
-    batch_size = 48
+    n_iters = 17
+    batch_size = 96
     elite_frac = 0.25
-    alpha = 0.7
+    alpha = 0.5
 
     # Policy distribution over (wn, wp)
     mean = np.array([0.65, 1.00], dtype=np.float32)

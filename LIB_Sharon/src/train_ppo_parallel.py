@@ -113,20 +113,20 @@ def main() -> None:
     NETLIST = os.getenv("NETLIST", "../netlists/inv.cir")
 
     N_ENVS = int(os.getenv("N_ENVS", "6"))
-    MAX_STEPS = int(os.getenv("MAX_STEPS", "6"))
-    TOTAL_TIMESTEPS = int(os.getenv("TOTAL_TIMESTEPS", "10000"))
+    MAX_STEPS = int(os.getenv("MAX_STEPS", "3"))
+    TOTAL_TIMESTEPS = int(os.getenv("TOTAL_TIMESTEPS", "15000"))
 
     # PPO rollout params
-    N_STEPS = int(os.getenv("N_STEPS", "68"))  # smaller -> faster feedback (still same total sims)
+    N_STEPS = int(os.getenv("N_STEPS", "120"))  # smaller -> faster feedback (still same total sims)
     N_EPOCHS = int(os.getenv("N_EPOCHS", "10"))
 
     # Compute a safe batch_size (divisor of n_steps*n_envs) to avoid SB3 warning
     rollout_size = N_STEPS * N_ENVS
     #BATCH_SIZE = int(os.getenv("BATCH_SIZE", str(best_divisor_leq(rollout_size, 64))))
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "68"))
+    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "72"))
 
     # Eval settings (be careful: each eval episode = 1 SPICE sim here)
-    EVAL_FREQ = int(os.getenv("EVAL_FREQ", "500"))
+    EVAL_FREQ = int(os.getenv("EVAL_FREQ", "2000"))
     N_EVAL_EPISODES = int(os.getenv("N_EVAL_EPISODES", "4"))
 
     DEBUG = bool(int(os.getenv("DEBUG", "0")))

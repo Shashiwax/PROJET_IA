@@ -10,7 +10,9 @@ dependencies = [
     "numpy>=2.3.5",
     "pandas>=2.3.3",
     "pyngs",
+    "rich>=14.2.0",
     "stable-baselines3>=2.7.1",
+    "tqdm>=4.67.1",
 ]
 
 [tool.uv.sources]

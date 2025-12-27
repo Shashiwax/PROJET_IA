@@ -77,8 +77,8 @@ CLOAD Y 0 {cload}
 * A=0 (entrée basse) entre 1.2ns et 1.8ns
 .meas tran pstat_in0 AVG par('-(v(VP)*i(VDD) + v(A)*i(VIN))') FROM={t1a} TO={t1b}
 .meas tran pstat_vdd_in0 AVG par('-(v(VP)*i(VDD))') FROM={t1a} TO={t1b}
-.meas tran ymean_A1 AVG v(Y) FROM={t0a} TO={t0b}
-.meas tran ymean_A0 AVG v(Y) FROM={t1a} TO={t1b}
+.meas tran ymean_a1 AVG v(Y) FROM={t0a} TO={t0b}
+.meas tran ymean_a0 AVG v(Y) FROM={t1a} TO={t1b}
 
 * 4. CONSOMMATION DYNAMIQUE (Dynamic Energy)
 * Mesure de l'intégrale de la puissance totale entre deux points

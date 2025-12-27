@@ -1,416 +1,583 @@
 # inverter_env.py
-# Stable mono-env for SKY130 inverter using ngspice as a SUBPROCESS with HARD TIMEOUT.
-#
-# Fix in this version:
-# - Your metrics stayed constant because wn/wp were not applied.
-# - We now directly REWRITE the .param wn=... and .param wp=... lines in the temporary netlist.
-# - We also inject .meas wn_chk/wp_chk to confirm parameter values.
-#
-# Still included:
-# - SPICE CWD detection so sky130copy.lib.spice relative includes work.
-# - Hard timeout kill of ngspice process group (no hangs).
-
 from __future__ import annotations
 
 import os
 import re
+import time
+import math
 import signal
-import subprocess
 import tempfile
-from contextlib import contextmanager
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Tuple, Any, Optional
 
-import gymnasium as gym
 import numpy as np
+import gymnasium as gym
 from gymnasium import spaces
 
 
-@contextmanager
-def pushd(path: Path):
-    old_cwd = Path.cwd()
-    os.chdir(path)
+# -----------------------------
+# Reward configuration
+# -----------------------------
+@dataclass(frozen=True)
+class RewardConfig:
+    """
+    Reward shaping designed to be PPO-friendly (bounded penalties, learnable gradients).
+    All units in this config are in *human units*:
+      - area in um^2
+      - delay in ps
+      - power in uW
+      - energy in fJ
+    """
+    # Baseline reference for normalization (your inv_1 baseline)
+    ref_cell_area_um2: float = 3.7536
+    ref_delay_max_ps: float = 18.96081
+    ref_pstat_wc_uW: float = 1.295751
+    ref_edyn_fJ: float = 1.96807
+
+    # Weights for the 4 specs (cost terms)
+    w_area: float = 0.40
+    w_delay: float = 0.20
+    w_pstat: float = 0.20
+    w_edyn: float = 0.20
+
+    # Soft size regularizer (discourage oversizing beyond baseline)
+    w_size: float = 0.10
+    wn0: float = 0.65
+    wp0: float = 1.00
+
+    # Logic constraints (soft penalties + hard cut-off)
+    vdd: float = 1.8
+    yhi_ratio: float = 0.95   # want Y ~ VDD when A=0
+    ylo_ratio: float = 0.05   # want Y ~ 0 when A=1
+
+    # Soft penalty weights (bounded)
+    w_logic_hi: float = 0.50
+    w_logic_lo: float = 0.50
+
+    # Hard cut-off (if badly violated, treat as failure)
+    hard_hi_ratio: float = 0.80
+    hard_lo_ratio: float = 0.20
+
+    # Failure reward (bounded -> PPO-friendly)
+    fail_reward: float = -50.0
+
+    # Clip ratios to avoid huge spikes
+    ratio_clip: float = 10.0
+
+
+# -----------------------------
+# Helpers: subprocess ngspice
+# -----------------------------
+_MEAS_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", re.MULTILINE)
+
+
+def _kill_process_group(p: subprocess.Popen) -> None:
+    """Kill a process group (POSIX)."""
     try:
-        yield
-    finally:
-        os.chdir(old_cwd)
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
 
 
-@dataclass
-class RewardWeights:
-    w_area: float = 0.25
-    w_delay: float = 0.35
-    w_edyn: float = 0.25
-    w_pstat: float = 0.15
+def run_ngspice_batch(
+    netlist_path: Path,
+    cwd: Path,
+    log_path: Path,
+    timeout_s: float,
+) -> str:
+    """
+    Run ngspice in batch mode and return the stdout/stderr text (from log file).
+    Uses a new process group so we can hard-kill on timeout.
+    """
+    cmd = ["ngspice", "-b", "-o", str(log_path), str(netlist_path)]
+
+    # Create a new process group (POSIX) so we can kill all children on timeout.
+    preexec = os.setsid if os.name != "nt" else None
+
+    p = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=preexec,
+    )
+
+    try:
+        p.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(p)
+        raise RuntimeError(f"ngspice timeout after {timeout_s}s")
+
+    if not log_path.exists():
+        raise RuntimeError("ngspice did not produce a log file")
+
+    text = log_path.read_text(errors="ignore")
+    if "Error: circuit not parsed" in text:
+        raise RuntimeError('"Error: circuit not parsed."')
+
+    return text
 
 
-@dataclass
-class RewardNorms:
-    area_um2: float = 5.0
-    delay_ps: float = 20.0
-    edyn_fj: float = 2.0
-    pstat_uw: float = 1.0
+def parse_measures(log_text: str) -> Dict[str, float]:
+    """
+    Parse ngspice .meas results from log output.
+    Returns a dict with lower-cased measure names.
+    """
+    out: Dict[str, float] = {}
+    for m in _MEAS_RE.finditer(log_text):
+        k = m.group(1).strip().lower()
+        v = float(m.group(2))
+        out[k] = v
+    return out
 
 
+# -----------------------------
+# Inverter Environment
+# -----------------------------
 class InverterEnv(gym.Env):
+    """
+    PPO-friendly environment for inverter sizing (wn, wp).
+    - Action space: Box([-1,1], shape=(2,))
+    - Observation: current (wn, wp)
+    - Each step runs exactly one SPICE simulation and returns reward + metrics.
+    """
+
     metadata = {"render_modes": []}
 
     def __init__(
         self,
-        netlist_path: Optional[str | Path] = None,
-        wn_range: Tuple[float, float] = (0.36, 0.65),
-        wp_range: Tuple[float, float] = (0.36, 1.00),
-        max_steps: int = 25,
-        reset_to_nominal: bool = True,
-        nominal_wn: float = 0.65,
-        nominal_wp: float = 1.00,
-        random_reset: bool = False,
-        reward_weights: RewardWeights = RewardWeights(),
-        reward_norms: RewardNorms = RewardNorms(),
+        netlist_path: str | Path,
+        max_steps: int = 1,
+        reward_cfg: Optional[RewardConfig] = None,
         seed: Optional[int] = None,
-        ngspice_bin: str = "ngspice",
-        timeout_s: float = 5.0,
+        # Parameter bounds (um)
+        wn_min: float = 0.20,
+        wn_max: float = 1.26,
+        wp_min: float = 0.20,
+        wp_max: float = 1.65,
+        # Discretization step (um) to avoid weird values and reduce crashes
+        snap_step: float = 0.01,
+        # Fast training overrides
+        fast_mode: bool = True,
+        fast_tran_step: str = "5p",
+        fast_tsim: str = "2n",
+        # ngspice timeout (seconds)
+        timeout_s: float = 20.0,
+        # Cache size (per-process)
+        cache_max: int = 5000,
+        # Debug prints
+        debug: bool = False,
+        # If True, run one simulation at reset (slower). Keep False for PPO.
+        simulate_on_reset: bool = False,
     ) -> None:
         super().__init__()
 
-        self.wn_min, self.wn_max = float(wn_range[0]), float(wn_range[1])
-        self.wp_min, self.wp_max = float(wp_range[0]), float(wp_range[1])
+        self.netlist_path = Path(netlist_path)
+        if not self.netlist_path.exists():
+            raise FileNotFoundError(f"netlist not found: {self.netlist_path}")
+
         self.max_steps = int(max_steps)
+        self.cfg = reward_cfg or RewardConfig()
+        self.debug = bool(debug)
+        self.simulate_on_reset = bool(simulate_on_reset)
 
-        self.reset_to_nominal = bool(reset_to_nominal)
-        self.nominal_wn = float(nominal_wn)
-        self.nominal_wp = float(nominal_wp)
-        self.random_reset = bool(random_reset)
+        self.wn_min = float(wn_min)
+        self.wn_max = float(wn_max)
+        self.wp_min = float(wp_min)
+        self.wp_max = float(wp_max)
+        self.snap_step = float(snap_step)
 
-        self.w = reward_weights
-        self.n = reward_norms
+        self.fast_mode = bool(fast_mode)
+        self.fast_tran_step = str(fast_tran_step)
+        self.fast_tsim = str(fast_tsim)
 
-        self.ngspice_bin = ngspice_bin
         self.timeout_s = float(timeout_s)
+        self.cache_max = int(cache_max)
 
-        self.netlist_path = self._resolve_netlist_path(netlist_path)
-        self.spice_cwd = self._detect_spice_cwd(self.netlist_path)
+        # PPO recommendation: symmetric action space
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
-        # Base netlist without final .end (we will rewrite params + append control)
-        self._base_no_end = self._read_netlist_without_final_end(self.netlist_path)
-
-        self.action_space = spaces.Box(
+        # Observation is current (wn, wp)
+        self.observation_space = spaces.Box(
             low=np.array([self.wn_min, self.wp_min], dtype=np.float32),
             high=np.array([self.wn_max, self.wp_max], dtype=np.float32),
             dtype=np.float32,
         )
 
-        low = np.array([self.wn_min, self.wp_min, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        high = np.array(
-            [
-                self.wn_max,
-                self.wp_max,
-                np.finfo(np.float32).max,
-                np.finfo(np.float32).max,
-                np.finfo(np.float32).max,
-                np.finfo(np.float32).max,
-                np.finfo(np.float32).max,
-                np.finfo(np.float32).max,
-            ],
-            dtype=np.float32,
-        )
-        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+        self.rng = np.random.default_rng(seed)
 
-        self._np_random, _ = gym.utils.seeding.np_random(seed)
-        self._step_count = 0
+        # Read and keep a template of the netlist text
+        self.base_text = self.netlist_path.read_text(errors="ignore")
 
-    # ----------------------------
-    # Path + netlist utilities
-    # ----------------------------
+        # Infer SPICE CWD from the .lib path (needed for relative .include inside sky130copy.lib.spice)
+        self.spice_cwd = self._infer_spice_cwd(self.base_text)
 
-    def _resolve_netlist_path(self, netlist_path: Optional[str | Path]) -> Path:
-        if netlist_path is not None:
-            p = Path(netlist_path).expanduser().resolve()
-            if not p.exists():
-                raise FileNotFoundError(f"Netlist not found: {p}")
-            return p
+        # Per-env temp directory (important: each Subproc env has its own process -> safe)
+        self.workdir = Path(tempfile.mkdtemp(prefix="inv_env_"))
 
-        local_candidate = (Path(__file__).resolve().parent / "netlists" / "inv.cir")
-        if local_candidate.exists():
-            return local_candidate
+        # Runtime state
+        self.step_count = 0
+        self.wn = self.cfg.wn0
+        self.wp = self.cfg.wp0
 
-        abs_candidate = Path("/home/sharo/PROJET_IA/LIB_Sharon/netlists/inv.cir")
-        if abs_candidate.exists():
-            return abs_candidate.resolve()
+        # Cache: (wn, wp) -> metrics dict
+        self._cache: Dict[Tuple[float, float], Dict[str, float]] = {}
 
-        raise FileNotFoundError("Netlist path not provided and no default inv.cir found.")
+    # -------- netlist rewriting --------
 
-    def _detect_spice_cwd(self, netlist_path: Path) -> Path:
-        lines = netlist_path.read_text(errors="ignore").splitlines()
-        lib_re = re.compile(r'^\s*\.lib\s+"([^"]+)"', re.IGNORECASE)
-        inc_re = re.compile(r'^\s*\.include\s+"([^"]+)"', re.IGNORECASE)
-
-        candidates: list[Path] = []
-
-        for raw in lines:
-            line = raw.strip()
-            if not line or line.startswith("*"):
-                continue
-
-            m = lib_re.match(line)
-            if m:
-                p = Path(m.group(1)).expanduser()
-                p = (netlist_path.parent / p).resolve() if not p.is_absolute() else p.resolve()
-                candidates.append(p)
-                continue
-
-            m = inc_re.match(line)
-            if m:
-                p = Path(m.group(1)).expanduser()
-                if p.is_absolute():
-                    candidates.append(p.resolve())
-
-        for p in candidates:
-            if p.exists():
-                return p.parent
-
-        return netlist_path.parent
-
-    def _read_netlist_without_final_end(self, netlist_path: Path) -> str:
-        lines = netlist_path.read_text(errors="ignore").splitlines()
-        while lines and not lines[-1].strip():
-            lines.pop()
-        if lines and lines[-1].strip().lower().startswith(".end"):
-            lines.pop()
-        return "\n".join(lines) + "\n"
-
-    def _rewrite_param(self, text: str, name: str, value: float) -> Tuple[str, bool]:
+    @staticmethod
+    def _infer_spice_cwd(net_text: str) -> Path:
         """
-        Replace the first occurrence of:
-          .param <name> = ...
-        with:
-          .param <name>=<value>
+        Find the first .lib "PATH" ... line and use its parent directory as CWD.
+        This is required because sky130copy.lib.spice contains relative .include paths.
         """
-        pat = re.compile(rf"(?im)^\s*\.param\s+{re.escape(name)}\s*=\s*.*$")
-        new_line = f".param {name}={value}"
-        new_text, n = pat.subn(new_line, text, count=1)
-        return new_text, (n == 1)
+        lib_re = re.compile(r'^\s*\.lib\s+"([^"]+)"\s+\S+', re.MULTILINE | re.IGNORECASE)
+        m = lib_re.search(net_text)
+        if m:
+            lib_path = Path(m.group(1))
+            if lib_path.exists():
+                return lib_path.parent
+        # Fallback: netlist directory
+        return Path.cwd()
 
-    # ----------------------------
-    # ngspice subprocess simulation
-    # ----------------------------
+    def _snap(self, x: float) -> float:
+        """Snap to a grid to reduce weird values and improve caching."""
+        if self.snap_step <= 0:
+            return float(x)
+        return float(round(x / self.snap_step) * self.snap_step)
 
-    def _build_run_netlist(self, wn: float, wp: float) -> str:
-        # Rewrite wn/wp directly (robust; no alterparam dependency)
-        txt, ok1 = self._rewrite_param(self._base_no_end, "wn", wn)
-        txt, ok2 = self._rewrite_param(txt, "wp", wp)
-        if not (ok1 and ok2):
-            raise RuntimeError("Could not find .param wn=... and/or .param wp=... to rewrite in inv.cir")
+    def _action_to_params(self, action: np.ndarray) -> Tuple[float, float]:
+        """
+        Map action in [-1,1] to (wn, wp) within bounds, then snap.
+        """
+        a = np.clip(action.astype(np.float32), -1.0, 1.0)
+        # Linear map [-1,1] -> [min,max]
+        wn = self.wn_min + (float(a[0]) + 1.0) * 0.5 * (self.wn_max - self.wn_min)
+        wp = self.wp_min + (float(a[1]) + 1.0) * 0.5 * (self.wp_max - self.wp_min)
 
-        # Inject checks + control block
-        injected = (
-            "\n"
-            "* --- injected by RL wrapper ---\n"
-            ".meas tran wn_chk param='wn'\n"
-            ".meas tran wp_chk param='wp'\n"
-            ".control\n"
-            "set noaskquit\n"
-            "set nomoremode\n"
-            "run\n"
-            "quit\n"
-            ".endc\n"
-            ".end\n"
+        wn = min(max(wn, self.wn_min), self.wn_max)
+        wp = min(max(wp, self.wp_min), self.wp_max)
+
+        wn = self._snap(wn)
+        wp = self._snap(wp)
+        return wn, wp
+
+    def _apply_overrides(self, text: str) -> str:
+        """
+        Apply fast-mode overrides (tsim + tran step).
+        Assumes the netlist contains `.param tsim=...` and `.tran <step> {tsim}` lines.
+        """
+        if not self.fast_mode:
+            return text
+
+        # Override .param tsim=...
+        text = re.sub(
+            r'^\s*\.param\s+tsim\s*=\s*[^\s]+',
+            f".param tsim={self.fast_tsim}",
+            text,
+            flags=re.MULTILINE | re.IGNORECASE,
         )
-        return txt + injected
 
-    def _parse_measures(self, text: str) -> Dict[str, float]:
-        measures: Dict[str, float] = {}
-        line_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)")
-        for raw in text.splitlines():
-            m = line_re.match(raw)
-            if not m:
-                continue
-            measures[m.group(1)] = float(m.group(2))
-        return measures
-
-    def _run_ngspice_killgroup(self, cmd: list[str], cwd: Path, timeout_s: float) -> None:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            text=True,
+        # Override .tran line first argument (tstep) but keep {tsim}
+        # Example: ".tran 1p {tsim}" -> ".tran 5p {tsim}"
+        text = re.sub(
+            r'^\s*\.tran\s+\S+\s+\{tsim\}',
+            f".tran {self.fast_tran_step} {{tsim}}",
+            text,
+            flags=re.MULTILINE | re.IGNORECASE,
         )
-        try:
-            proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            raise RuntimeError(f"ngspice timeout after {timeout_s}s")
+        return text
+
+    def _rewrite_netlist(self, wn: float, wp: float) -> Path:
+        """
+        Create a per-step netlist with overridden wn/wp and optional fast-mode.
+        """
+        txt = self.base_text
+
+        # Replace .param wn=... and wp=...
+        txt = re.sub(
+            r'^\s*\.param\s+wn\s*=\s*[^\s]+',
+            f".param wn={wn}",
+            txt,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
+        txt = re.sub(
+            r'^\s*\.param\s+wp\s*=\s*[^\s]+',
+            f".param wp={wp}",
+            txt,
+            flags=re.MULTILINE | re.IGNORECASE,
+        )
+
+        # Fast overrides
+        txt = self._apply_overrides(txt)
+
+        # Write to temp file
+        p = self.workdir / f"inv_wn{wn:.4f}_wp{wp:.4f}.cir"
+        p.write_text(txt)
+        return p
+
+    # -------- simulation + metrics --------
 
     def _simulate(self, wn: float, wp: float) -> Dict[str, float]:
-        run_netlist = self._build_run_netlist(wn, wp)
+        """
+        Run ngspice and return metrics in human units.
+        Uses caching to avoid repeated sims.
+        """
+        key = (wn, wp)
+        if key in self._cache:
+            return self._cache[key]
 
-        with tempfile.TemporaryDirectory(prefix="inv_rl_") as td:
-            td_path = Path(td)
-            cir_path = td_path / "run.cir"
-            out_path = td_path / "ngspice.out"
+        net_tmp = self._rewrite_netlist(wn, wp)
+        log_path = self.workdir / f"ngspice_wn{wn:.4f}_wp{wp:.4f}.log"
 
-            cir_path.write_text(run_netlist)
-
-            cmd = [self.ngspice_bin, "-b", "-o", str(out_path), str(cir_path)]
-            self._run_ngspice_killgroup(cmd, self.spice_cwd, self.timeout_s)
-
-            if not out_path.exists():
-                raise RuntimeError("ngspice produced no output file")
-
-            out_text = out_path.read_text(errors="ignore")
-            meas = self._parse_measures(out_text)
-
-            required = [
-                "cell_area",
-                "active_area",
-                "delay_fall",
-                "delay_rise",
-                "edyn_val",
-                "pstat_vdd_in0",
-                "pstat_vdd_in1",
-                "wn_chk",
-                "wp_chk",
-            ]
-            missing = [k for k in required if k not in meas]
-            if missing:
-                raise RuntimeError(f"Missing measures: {missing}")
-
-            # Convert units + clamp
-            metrics: Dict[str, float] = {}
-            metrics["cell_area_um2"] = max(0.0, meas["cell_area"])
-            metrics["active_area_um2"] = max(0.0, meas["active_area"])
-
-            metrics["delay_fall_ps"] = max(0.0, meas["delay_fall"] * 1e12)
-            metrics["delay_rise_ps"] = max(0.0, meas["delay_rise"] * 1e12)
-
-            edyn_fJ = meas["edyn_val"] * 1e15
-            metrics["edyn_fJ"] = max(0.0, edyn_fJ)
-
-            p0_w = meas["pstat_vdd_in0"]
-            p1_w = meas["pstat_vdd_in1"]
-            metrics["pstat_vdd_in0_uW"] = max(0.0, p0_w * 1e6)
-            metrics["pstat_vdd_in1_pW"] = max(0.0, p1_w * 1e12)
-            metrics["pstat_wc_uW"] = max(0.0, max(p0_w, p1_w) * 1e6)
-
-            # Debug checks: what wn/wp did ngspice actually use?
-            metrics["wn_chk"] = meas["wn_chk"]
-            metrics["wp_chk"] = meas["wp_chk"]
-
-            return metrics
-
-    # ----------------------------
-    # RL interface
-    # ----------------------------
-
-    def _make_obs(self, wn: float, wp: float, metrics: Dict[str, float]) -> np.ndarray:
-        return np.array(
-            [
-                wn,
-                wp,
-                metrics["cell_area_um2"],
-                metrics["active_area_um2"],
-                metrics["delay_fall_ps"],
-                metrics["delay_rise_ps"],
-                metrics["edyn_fJ"],
-                metrics["pstat_wc_uW"],
-            ],
-            dtype=np.float32,
+        t0 = time.time()
+        log_text = run_ngspice_batch(
+            netlist_path=net_tmp,
+            cwd=self.spice_cwd,
+            log_path=log_path,
+            timeout_s=self.timeout_s,
         )
+        dt = time.time() - t0
 
-    def _compute_reward(self, metrics: Dict[str, float]) -> float:
-        delay_ps = max(metrics["delay_rise_ps"], metrics["delay_fall_ps"])
-        area_um2 = metrics["cell_area_um2"]
-        edyn_fJ = metrics["edyn_fJ"]
-        pstat_wc_uW = metrics["pstat_wc_uW"]
+        meas = parse_measures(log_text)
 
-        area_n = area_um2 / max(self.n.area_um2, 1e-12)
-        delay_n = delay_ps / max(self.n.delay_ps, 1e-12)
-        edyn_n = edyn_fJ / max(self.n.edyn_fj, 1e-12)
-        pstat_n = pstat_wc_uW / max(self.n.pstat_uw, 1e-12)
+        # Required measures (case-insensitive)
+        required = [
+            "cell_area",
+            "active_area",
+            "delay_fall",
+            "delay_rise",
+            "edyn_val",
+            "pstat_vdd_in0",
+            "pstat_vdd_in1",
+            "ymean_a0",
+            "ymean_a1",
+        ]
+        missing = [k for k in required if k not in meas]
+        if missing:
+            raise RuntimeError(f"Missing measures: {missing}")
 
-        return -float(
-            self.w.w_area * area_n
-            + self.w.w_delay * delay_n
-            + self.w.w_edyn * edyn_n
-            + self.w.w_pstat * pstat_n
-        )
+        # Convert to human units
+        cell_area_um2 = float(meas["cell_area"])         # already um^2 by construction
+        active_area_um2 = float(meas["active_area"])     # already um^2 by construction
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        delay_fall_ps = float(meas["delay_fall"]) * 1e12
+        delay_rise_ps = float(meas["delay_rise"]) * 1e12
+        delay_max_ps = max(delay_fall_ps, delay_rise_ps)
+
+        edyn_fJ = float(meas["edyn_val"]) * 1e15
+
+        pstat_vdd_in0_uW = float(meas["pstat_vdd_in0"]) * 1e6
+        pstat_vdd_in1_uW = float(meas["pstat_vdd_in1"]) * 1e6
+        pstat_wc_uW = max(pstat_vdd_in0_uW, pstat_vdd_in1_uW)
+
+        ymean_a0 = float(meas["ymean_a0"])
+        ymean_a1 = float(meas["ymean_a1"])
+
+        metrics = {
+            "wn": wn,
+            "wp": wp,
+            "sim_time_s": dt,
+            "cell_area_um2": cell_area_um2,
+            "active_area_um2": active_area_um2,
+            "delay_fall_ps": delay_fall_ps,
+            "delay_rise_ps": delay_rise_ps,
+            "delay_max_ps": delay_max_ps,
+            "edyn_fJ": edyn_fJ,
+            "pstat_vdd_in0_uW": pstat_vdd_in0_uW,
+            "pstat_vdd_in1_uW": pstat_vdd_in1_uW,
+            "pstat_wc_uW": pstat_wc_uW,
+            "ymean_a0": ymean_a0,
+            "ymean_a1": ymean_a1,
+        }
+
+        # Cache management
+        if len(self._cache) >= self.cache_max:
+            # Simple eviction: clear everything (fast and safe)
+            self._cache.clear()
+        self._cache[key] = metrics
+        return metrics
+
+    # -------- reward --------
+
+    def _compute_reward(self, m: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+        """
+        Return (reward, breakdown) where breakdown helps you understand the compromise.
+        Reward is negative total cost (so higher is better).
+        """
+        cfg = self.cfg
+        eps = 1e-12
+
+        # Hard cut-off for very broken logic (PPO-friendly bounded fail)
+        hi_hard = cfg.hard_hi_ratio * cfg.vdd
+        lo_hard = cfg.hard_lo_ratio * cfg.vdd
+        if m["ymean_a0"] < hi_hard or m["ymean_a1"] > lo_hard:
+            return float(cfg.fail_reward), {
+                "fail": 1.0,
+                "reason_logic_hard": 1.0,
+            }
+
+        # Normalized ratios (clipped)
+        r_area = min(m["cell_area_um2"] / (cfg.ref_cell_area_um2 + eps), cfg.ratio_clip)
+        r_delay = min(m["delay_max_ps"] / (cfg.ref_delay_max_ps + eps), cfg.ratio_clip)
+        r_pstat = min(m["pstat_wc_uW"] / (cfg.ref_pstat_wc_uW + eps), cfg.ratio_clip)
+        r_edyn = min(m["edyn_fJ"] / (cfg.ref_edyn_fJ + eps), cfg.ratio_clip)
+
+        term_area = cfg.w_area * r_area
+        term_delay = cfg.w_delay * r_delay
+        term_pstat = cfg.w_pstat * r_pstat
+        term_edyn = cfg.w_edyn * r_edyn
+
+        # Soft size regularizer (only above baseline)
+        sz_n = max(0.0, (m["wn"] - cfg.wn0) / (cfg.wn0 + eps))
+        sz_p = max(0.0, (m["wp"] - cfg.wp0) / (cfg.wp0 + eps))
+        term_size = cfg.w_size * (sz_n + sz_p)
+
+        # Soft logic penalties around target thresholds
+        hi_tgt = cfg.yhi_ratio * cfg.vdd
+        lo_tgt = cfg.ylo_ratio * cfg.vdd
+
+        # Penalize only when violating thresholds
+        viol_hi = max(0.0, (hi_tgt - m["ymean_a0"]) / (hi_tgt + eps))
+        viol_lo = max(0.0, (m["ymean_a1"] - lo_tgt) / (lo_tgt + eps))
+
+        # Quadratic gives smoother gradients
+        term_logic = cfg.w_logic_hi * (viol_hi ** 2) + cfg.w_logic_lo * (viol_lo ** 2)
+
+        total_cost = term_area + term_delay + term_pstat + term_edyn + term_size + term_logic
+        reward = -float(total_cost)
+
+        breakdown = {
+            "fail": 0.0,
+            "r_area": r_area,
+            "r_delay": r_delay,
+            "r_pstat": r_pstat,
+            "r_edyn": r_edyn,
+            "term_area": term_area,
+            "term_delay": term_delay,
+            "term_pstat": term_pstat,
+            "term_edyn": term_edyn,
+            "term_size": term_size,
+            "term_logic": term_logic,
+            "cost": total_cost,
+        }
+        return reward, breakdown
+
+    # -------- Gym API --------
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
-        self._step_count = 0
 
-        if self.random_reset:
-            wn = float(self._np_random.uniform(self.wn_min, self.wn_max))
-            wp = float(self._np_random.uniform(self.wp_min, self.wp_max))
-        elif self.reset_to_nominal:
-            wn = float(np.clip(self.nominal_wn, self.wn_min, self.wn_max))
-            wp = float(np.clip(self.nominal_wp, self.wp_min, self.wp_max))
+        self.step_count = 0
+
+        # Randomize reset slightly to avoid degenerate constant observation
+        # (still 1-step episodes, but helps exploration a bit)
+        if options and options.get("random_reset", True):
+            self.wn = self._snap(self.rng.uniform(self.wn_min, self.wn_max))
+            self.wp = self._snap(self.rng.uniform(self.wp_min, self.wp_max))
         else:
-            wn = float(0.5 * (self.wn_min + self.wn_max))
-            wp = float(0.5 * (self.wp_min + self.wp_max))
+            self.wn = self.cfg.wn0
+            self.wp = self.cfg.wp0
 
-        try:
-            metrics = self._simulate(wn, wp)
-            obs = self._make_obs(wn, wp, metrics)
-            return obs, {"metrics": metrics, "spice_cwd": str(self.spice_cwd)}
-        except Exception as e:
-            obs = np.zeros((8,), dtype=np.float32)
-            return obs, {"metrics": {"error": str(e), "where": "reset"}, "spice_cwd": str(self.spice_cwd)}
+        obs = np.array([self.wn, self.wp], dtype=np.float32)
 
-    def step(self, action: np.ndarray):
-        self._step_count += 1
+        info: Dict[str, Any] = {
+            "spice_cwd": str(self.spice_cwd),
+            "wn": self.wn,
+            "wp": self.wp,
+        }
 
-        action = np.asarray(action, dtype=np.float32).reshape(-1)
-        wn = float(np.clip(action[0], self.wn_min, self.wn_max))
-        wp = float(np.clip(action[1], self.wp_min, self.wp_max))
+        if self.simulate_on_reset:
+            try:
+                m = self._simulate(self.wn, self.wp)
+                r, b = self._compute_reward(m)
+                info["metrics"] = m
+                info["breakdown"] = b
+                info["reward"] = r
+            except Exception as e:
+                info["metrics"] = {"error": str(e)}
+                info["reward"] = float(self.cfg.fail_reward)
+
+        return obs, info
+
+    def step(self, action):
+        self.step_count += 1
+
+        wn, wp = self._action_to_params(np.array(action, dtype=np.float32))
+        self.wn, self.wp = wn, wp
+        obs = np.array([wn, wp], dtype=np.float32)
 
         terminated = False
-        truncated = self._step_count >= self.max_steps
+        truncated = False
 
         try:
-            metrics = self._simulate(wn, wp)
-            obs = self._make_obs(wn, wp, metrics)
-            reward = self._compute_reward(metrics)
-            info = {"metrics": metrics, "spice_cwd": str(self.spice_cwd)}
-            return obs, reward, terminated, truncated, info
+            m = self._simulate(wn, wp)
+            r, b = self._compute_reward(m)
+
+            # Episode ends when reaching max_steps
+            if self.step_count >= self.max_steps:
+                truncated = True
+
+            info = {
+                "metrics": m,
+                "breakdown": b,
+                "spice_cwd": str(self.spice_cwd),
+            }
+
+            if self.debug:
+                print(f"[DEBUG] step={self.step_count} wn={wn:.4f} wp={wp:.4f} r={r:.4f} cost={b.get('cost', None)}")
+
+            return obs, float(r), terminated, truncated, info
+
         except Exception as e:
-            obs = np.zeros((8,), dtype=np.float32)
-            reward = -1e6
+            # PPO-friendly bounded failure
+            info = {
+                "metrics": {"error": str(e), "wn": wn, "wp": wp, "where": "step"},
+                "breakdown": {"fail": 1.0},
+                "spice_cwd": str(self.spice_cwd),
+            }
+            # End quickly on failure (prevents wasting steps)
             terminated = True
-            truncated = True
-            info = {"metrics": {"error": str(e), "wn": wn, "wp": wp, "where": "step"}, "spice_cwd": str(self.spice_cwd)}
-            return obs, reward, terminated, truncated, info
+            return obs, float(self.cfg.fail_reward), terminated, True, info
 
     def close(self) -> None:
+        # Best effort: cleanup temp directory
+        try:
+            for p in self.workdir.glob("*"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            try:
+                self.workdir.rmdir()
+            except Exception:
+                pass
+        except Exception:
+            pass
         super().close()
 
 
 if __name__ == "__main__":
-    print("ENV BACKEND = SUBPROCESS (param rewrite + hard-timeout kill group)", flush=True)
+    # Quick manual smoke test (no SB3)
+    env = InverterEnv(
+        netlist_path=os.getenv("NETLIST", "../netlists/inv.cir"),
+        max_steps=1,
+        debug=True,
+        simulate_on_reset=True,
+    )
+    obs, info = env.reset(options={"random_reset": False})
+    print("RESET obs:", obs)
+    print("RESET info:", info)
 
-    env = InverterEnv(max_steps=10, random_reset=False, timeout_s=5.0)
-    obs, info = env.reset()
-
-    print("RESET obs:", obs, flush=True)
-    print("RESET metrics:", info.get("metrics", {}), flush=True)
-    print("SPICE CWD:", info.get("spice_cwd", ""), flush=True)
-
-    for t in range(10):
-        print(f"\n[DEBUG] entering step {t+1}", flush=True)
-        a = env.action_space.sample()
-        obs, r, term, trunc, info = env.step(a)
-        print(f"step={t+1} action={a} reward={r:.6f} term={term} trunc={trunc}", flush=True)
-        print("metrics:", info.get("metrics", {}), flush=True)
-        if term or trunc:
-            break
-
+    a = env.action_space.sample()
+    obs, r, term, trunc, info = env.step(a)
+    print("STEP action:", a)
+    print("STEP reward:", r, "term:", term, "trunc:", trunc)
+    print("metrics:", info.get("metrics", {}))
+    print("breakdown:", info.get("breakdown", {}))
     env.close()

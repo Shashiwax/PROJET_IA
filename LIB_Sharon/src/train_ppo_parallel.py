@@ -112,22 +112,22 @@ def main() -> None:
     # -------------------------
     NETLIST = os.getenv("NETLIST", "../netlists/inv.cir")
 
-    N_ENVS = int(os.getenv("N_ENVS", "4"))
-    MAX_STEPS = int(os.getenv("MAX_STEPS", "1"))
-    TOTAL_TIMESTEPS = int(os.getenv("TOTAL_TIMESTEPS", "5000"))
+    N_ENVS = int(os.getenv("N_ENVS", "6"))
+    MAX_STEPS = int(os.getenv("MAX_STEPS", "6"))
+    TOTAL_TIMESTEPS = int(os.getenv("TOTAL_TIMESTEPS", "10000"))
 
     # PPO rollout params
-    N_STEPS = int(os.getenv("N_STEPS", "128"))  # smaller -> faster feedback (still same total sims)
+    N_STEPS = int(os.getenv("N_STEPS", "68"))  # smaller -> faster feedback (still same total sims)
     N_EPOCHS = int(os.getenv("N_EPOCHS", "10"))
 
     # Compute a safe batch_size (divisor of n_steps*n_envs) to avoid SB3 warning
     rollout_size = N_STEPS * N_ENVS
     #BATCH_SIZE = int(os.getenv("BATCH_SIZE", str(best_divisor_leq(rollout_size, 64))))
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "128"))
+    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "68"))
 
     # Eval settings (be careful: each eval episode = 1 SPICE sim here)
     EVAL_FREQ = int(os.getenv("EVAL_FREQ", "500"))
-    N_EVAL_EPISODES = int(os.getenv("N_EVAL_EPISODES", "3"))
+    N_EVAL_EPISODES = int(os.getenv("N_EVAL_EPISODES", "4"))
 
     DEBUG = bool(int(os.getenv("DEBUG", "0")))
 
@@ -234,11 +234,11 @@ def main() -> None:
         vec_env,
         verbose=1,
         tensorboard_log=str(tb_log),
-        learning_rate=3e-4,   # Standard stable (vu dans ton TP)
+        learning_rate=3e-4,
         n_steps=N_STEPS,
         batch_size=BATCH_SIZE,
         n_epochs=10,
-        gamma=0.99,           # Standard
+        gamma=0.95,           # Standard
         # AJOUT : Curiosité pour éviter de rester bloqué au maximum (wn=1.26, wp=1.65)
         ent_coef=0.01,        
         clip_range=0.2,
@@ -257,7 +257,7 @@ def main() -> None:
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         callback=eval_cb,
-        progress_bar=False,  # avoids tqdm/rich dependency
+        progress_bar=True,  # avoids tqdm/rich dependency
     )
 
     # Save final model

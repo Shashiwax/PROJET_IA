@@ -61,7 +61,7 @@ class RewardConfig:
     hard_lo_ratio: float = 0.20
 
     # Failure reward (bounded -> PPO-friendly)
-    fail_reward: float = -50.0
+    fail_reward: float = -25.0
 
     # Clip ratios to avoid huge spikes
     ratio_clip: float = 10.0

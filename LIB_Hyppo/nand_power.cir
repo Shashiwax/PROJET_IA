@@ -1,0 +1,30 @@
+* Fichier netlist de la Nand utilisée
+
+.param vdd=1.8
+.lib /home/tp-soa/Projet_SOA/PROJET_IA/.ciel/sky130A/libs.tech/ngspice/sky130tt.lib.spice tt
+.include /home/tp-soa/Projet_SOA/PROJET_IA/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/spice/sky130_fd_sc_hd_nand.spice
+
+* --- Paramètres (Variables pour l'agent RL) ---
+.param wn_val = 0.42e+06u
+.param wp_val = 0.42e+06u
+
+* --- Alimentation et signaux ---
+Vpwr VPWR 0 1.8V
+Vgnd VGND 0 0V
+Va A 0 PWL(0 0 20n 0 20.05n {vdd} 40n {vdd}	)
+Vb B 0 PWL(0 0 10n 0 10.05n  {vdd} 30n {vdd} 30.05n 0 40n 0)
+* --- Instance de la NAND ---
+X1 A B VGND VGND VPWR VPWR Y sky130_fd_sc_hd__nand2_1 wn={wn_val} wp={wp_val}
+
+* --- Analyse Transitoire ---
+.tran 0.05n 40n
+
+* --- Mesures (Directives Directes) ---0
+.meas tran cell_area PARAM='(wn_val + wp_val) * 2.72e+06u'
+
+* Consommations statiques et dynamiques
+
+.meas tran static_power AVG PAR('V(VPWR)*-i(Vpwr)') FROM=2n to=8n
+.meas tran dyn_power AVG PAR('V(VPWR)*-i(Vpwr)') FROM=10n TO=40n
+
+.end

@@ -1,62 +1,95 @@
 from pathlib import Path
 from pyngs.core import NGSpiceInstance
-import numpy as np
 import os
+from loguru import logger
 
 class NANDTestbench:
-    def __init__(self, netlist_path: Path):
-        # CORRECTION 1 : Conversion en chemin absolu et en string
-        # NGSpice a souvent du mal avec les chemins relatifs ou les objets Path
-        self.netlist_path = str(Path(netlist_path).resolve())
+    def __init__(self, delay_netlist_path: str, power_netlist_path: str):
+        self.delay_netlist = str(Path(delay_netlist_path).resolve())
+        self.power_netlist = str(Path(power_netlist_path).resolve())
         
-        if not os.path.exists(self.netlist_path):
-            raise FileNotFoundError(f"Le fichier netlist n'existe pas : {self.netlist_path}")
-
-        self.inst = NGSpiceInstance()
+        # --- OPTIMISATION : DOUBLE BUFFERING ---
+        # On charge les deux simulations EN MÉMOIRE dès le début.
+        # On ne fera plus jamais de .load() ensuite.
         
-        # Chargement du circuit
-        try:
-            self.inst.load(self.netlist_path)
-            print(f"Netlist chargée avec succès : {self.netlist_path}")
-        except Exception as e:
-            print(f"Erreur lors du chargement de la netlist : {e}")
-            raise
+        logger.info("Chargement des instances NGSpice (Delay & Power)...")
+        
+        # Instance 1 : Délai
+        self.inst_delay = NGSpiceInstance()
+        if not os.path.exists(self.delay_netlist):
+            raise FileNotFoundError(f"Netlist introuvable: {self.delay_netlist}")
+        self.inst_delay.load(self.delay_netlist)
+        
+        # Instance 2 : Puissance
+        self.inst_power = NGSpiceInstance()
+        if not os.path.exists(self.power_netlist):
+            raise FileNotFoundError(f"Netlist introuvable: {self.power_netlist}")
+        self.inst_power.load(self.power_netlist)
+        
+        logger.info("Instances chargées et prêtes.")
 
-    def run_simulation(self, w_values : np.ndarray):
-        """Lance la simulation NGSpice."""
-        self.inst.set_parameter('wn_val', w_values[0])
-        self.inst.set_parameter('wp_val', w_values[1])
-        self.inst.run()
+    def run_specific_simulation(self, mode, w_values: list):
+        """
+        Sélectionne l'instance déjà chargée, met à jour W, et relance.
+        """
+        # 1. Sélection de l'instance active
+        if mode == "DELAY":
+            inst = self.inst_delay
+        elif mode == "POWER":
+            inst = self.inst_power
+        else:
+            raise ValueError(f"Mode inconnu : {mode}")
 
-    def get_delay_measurements(self):
-        """Récupère les mesures de délai de la NAND."""
-        delays = {
-            "trise1": self.inst.get_measure('trise1') * 1e9,  # Convert to ns
-            "trise2": self.inst.get_measure('trise2') * 1e9,
-            "tfall1": self.inst.get_measure('tfall1') * 1e9,
-            "tfall2": self.inst.get_measure('tfall2') * 1e9,
-        }
-        assert all(value is not None for value in delays.values()), "One or more delay measurements not found in the simulation results."
-        return delays
+        # 2. Mise à jour des paramètres (Rapide, en mémoire)
+        # w_values = ["1.0e-6", "2.0e-6"]
+        inst.set_parameter('wn_val', w_values[0])
+        inst.set_parameter('wp_val', w_values[1])
 
-    def get_area_measurement(self):
-        """Récupère la mesure de surface de la NAND."""
-        area = self.inst.get_measure('cell_area')  # Assuming 'area' is a valid measure
-        assert area is not None, "Area measurement not found in the simulation results."
-        return area
-    
-    def get_power_measurement(self):
-        """Récupère la mesure de puissance de la NAND."""
-        power = self.inst.get_measure('power')  # Assuming 'power' is a valid measure
-        assert power is not None, "Power measurement not found in the simulation results."
-        return power
-    
-    def get_all_measurements(self):
-        """Récupère toutes les mesures de la NAND."""
+        # 3. Exécution
+        # Comme la netlist est déjà chargée, run() devrait juste relancer l'analyse
+        inst.run()
+
+    def get_measurements(self, mode):
+        """Récupère les mesures sur l'instance concernée."""
         measurements = {}
-        measurements['delays'] = self.get_delay_measurements()
-        measurements['area'] = self.get_area_measurement()
+        
+        if mode == "DELAY":
+            inst = self.inst_delay
+            try:
+                # Area
+                area = inst.get_measure('cell_area')
+                if area is not None: 
+                    measurements['area'] = area
+
+                # Delays
+                delays = {}
+                for key in ['trise1', 'trise2', 'tfall1', 'tfall2']:
+                    val = inst.get_measure(key)
+                    if val is not None:
+                        delays[key] = val * 1e9 # ns
+                
+                if delays:
+                    measurements['delays'] = delays
+            except Exception:
+                pass
+
+        elif mode == "POWER":
+            inst = self.inst_power
+            try:
+                p_static = inst.get_measure('static_power')
+                p_dyn = inst.get_measure('dyn_power')
+                
+                p_data = {}
+                if p_static is not None: p_data['static'] = float(p_static)
+                if p_dyn is not None: p_data['dynamic'] = float(p_dyn)
+                
+                if p_data:
+                    measurements['power'] = p_data
+            except Exception:
+                pass
+
         return measurements
+    
 
     def stop_simulation(self):
         """Arrête la simulation NGSpice."""

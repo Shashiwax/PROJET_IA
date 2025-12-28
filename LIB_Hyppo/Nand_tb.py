@@ -1,18 +1,20 @@
 from pathlib import Path
 from pyngs.core import NGSpiceInstance
 import os
+import numpy as np
 from loguru import logger
 
 class NANDTestbench:
     def __init__(self, delay_netlist_path: str, power_netlist_path: str):
+        # Conversion des chemins
         self.delay_netlist = str(Path(delay_netlist_path).resolve())
         self.power_netlist = str(Path(power_netlist_path).resolve())
         
-        # --- OPTIMISATION : DOUBLE BUFFERING ---
-        # On charge les deux simulations EN MÉMOIRE dès le début.
-        # On ne fera plus jamais de .load() ensuite.
-        
-        logger.info("Chargement des instances NGSpice (Delay & Power)...")
+        # --- CORRECTION ICI : Initialisation de la variable manquante ---
+        self.active_instance = None 
+        # ----------------------------------------------------------------
+
+        logger.info("Chargement initial des instances NGSpice...")
         
         # Instance 1 : Délai
         self.inst_delay = NGSpiceInstance()
@@ -26,36 +28,68 @@ class NANDTestbench:
             raise FileNotFoundError(f"Netlist introuvable: {self.power_netlist}")
         self.inst_power.load(self.power_netlist)
         
-        logger.info("Instances chargées et prêtes.")
+        logger.info("Instances chargées.")
 
     def run_specific_simulation(self, mode, w_values: list):
         """
-        Sélectionne l'instance déjà chargée, met à jour W, et relance.
+        Sélectionne l'instance, met à jour W, et relance.
         """
-        # 1. Sélection de l'instance active
+        # 1. Sélection de l'instance active et mise à jour de la référence
         if mode == "DELAY":
-            inst = self.inst_delay
+            self.active_instance = self.inst_delay
         elif mode == "POWER":
-            inst = self.inst_power
+            self.active_instance = self.inst_power
         else:
             raise ValueError(f"Mode inconnu : {mode}")
 
         # 2. Mise à jour des paramètres (Rapide, en mémoire)
         # w_values = ["1.0e-6", "2.0e-6"]
-        inst.set_parameter('wn_val', w_values[0])
-        inst.set_parameter('wp_val', w_values[1])
+        self.active_instance.set_parameter('wn_val', w_values[0])
+        self.active_instance.set_parameter('wp_val', w_values[1])
 
         # 3. Exécution
-        # Comme la netlist est déjà chargée, run() devrait juste relancer l'analyse
-        inst.run()
+        self.active_instance.run()
+
+    def check_simulation_health(self):
+        """
+        Vérifie si la dernière simulation a convergé correctement.
+        """
+        # Si aucune simulation n'a encore tourné, c'est 'sain' par défaut ou on attend
+        if self.active_instance is None:
+            return True
+
+        try:
+            # On vérifie si le vecteur temps existe et est complet
+            time_vec = self.active_instance.get_vector('time')
+            
+            if time_vec is None or len(time_vec) == 0:
+                return False
+            
+            # Vérification de la durée finale
+            last_time = time_vec[-1]
+            if last_time < 1e-12: # Seuil minimal de sécurité
+                return False
+                
+            return True
+            
+        except Exception:
+            return False
 
     def get_measurements(self, mode):
         """Récupère les mesures sur l'instance concernée."""
         measurements = {}
         
+        # On utilise l'instance correspondant au mode demandé
         if mode == "DELAY":
             inst = self.inst_delay
-            try:
+        elif mode == "POWER":
+            inst = self.inst_power
+        else:
+            return {}
+
+        try:
+            # --- Mesures Delay & Area ---
+            if mode == "DELAY":
                 # Area
                 area = inst.get_measure('cell_area')
                 if area is not None: 
@@ -70,12 +104,9 @@ class NANDTestbench:
                 
                 if delays:
                     measurements['delays'] = delays
-            except Exception:
-                pass
 
-        elif mode == "POWER":
-            inst = self.inst_power
-            try:
+            # --- Mesures Power ---
+            elif mode == "POWER":
                 p_static = inst.get_measure('static_power')
                 p_dyn = inst.get_measure('dyn_power')
                 
@@ -85,23 +116,9 @@ class NANDTestbench:
                 
                 if p_data:
                     measurements['power'] = p_data
-            except Exception:
-                pass
+
+        except Exception as e:
+            logger.warning(f"Erreur lecture mesures ({mode}): {e}")
+            pass
 
         return measurements
-    
-
-    def stop_simulation(self):
-        """Arrête la simulation NGSpice."""
-        self.inst.stop()
-
-"""if __name__ == "__main__":
-    nand_tb = NANDTestbench(Path("LIB_Hyppo/nand.cir"))
-
-    # Example transistor widths in micrometers
-    w_values = ["1.0e+06u", "2.0e+06u"]  # [W_nmos, W_pmos]
-
-    nand_tb.run_simulation(w_values)
-    measurements = nand_tb.get_all_measurements()
-    print("NAND Measurements:", measurements)
-    nand_tb.stop_simulation()"""

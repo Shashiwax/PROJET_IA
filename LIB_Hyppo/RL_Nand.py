@@ -8,18 +8,17 @@ class NANDOpt(gym.Env):
     def __init__(self, delay_netlist, power_netlist):
         super().__init__()
         
-        # Initialisation du TB avec les deux fichiers
         self.testbench = nand_tb.NANDTestbench(delay_netlist, power_netlist)
-        
         self.current_action = np.array([1.0, 1.0], dtype=float)
         
-        # Action : Wn, Wp
+        # Action : [Wn, Wp] (micromètres)
         self.action_space = gym.spaces.Box(low=0.42, high=2.0, shape=(2,), dtype=float)
         
-        # Observation : [Normalized_Delay, Normalized_Power, Normalized_Area]
-        # L'agent a besoin de voir les 3 métriques pour comprendre le compromis
-        self.observation_space = gym.spaces.Box(low=0, high=np.inf, shape=(3,), dtype=float)
-
+        # Observation : [Norm_Delay, Norm_P_Static, Norm_P_Dynamic, Norm_Area]
+        # On passe à 4 dimensions pour séparer les types de puissance
+        self.observation_space = gym.spaces.Box(low=0, high=np.inf, shape=(4,), dtype=float)
+        
+        self.step_counter = 0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -27,45 +26,53 @@ class NANDOpt(gym.Env):
         return obs, {}
     
     def step(self, action):
+        self.step_counter += 1
         self.current_action = action
         
-        # 1. Exécution Séquentielle
+        # 1. Simulation et Récupération des 4 métriques normalisées
         obs = self._run_sequence_and_get_results()
         
-        # obs = [norm_delay, norm_power, norm_area]
         norm_delay = obs[0]
-        norm_power = obs[1]
-        norm_area = obs[2] # Si tu veux optimiser l'aire aussi
+        norm_p_stat = obs[1]
+        norm_p_dyn = obs[2]
+        norm_area = obs[3]
 
-        # --- CALCUL DU REWARD (FONCTION DE COÛT) ---
-        # Objectif : Minimiser Délai ET Puissance.
-        # Formule classique : PDP (Power Delay Product) ou somme pondérée (EDP).
+        # --- REWARD SYSTEM (FONCTION DE COÛT) ---
+        # Définition des poids (A ajuster selon tes priorités !)
         
-        # Poids (A ajuster selon ce qui est prioritaire pour toi)
-        # Si le délai est prioritaire, augmente ALPHA.
-        ALPHA = 0.5  # Poids du Délai
-        BETA = 0.5   # Poids de la Puissance
-        # GAMMA = 0.1 # Poids de l'Aire (optionnel)
-
-        # Reward négatif car on veut minimiser
-        reward = - (ALPHA * norm_delay + BETA * norm_power)
+        W_DELAY = 0.4       # Priorité au délai
+        W_P_DYN = 0.3       # La conso active est souvent dominante
+        W_P_STAT = 0.1      # Les fuites (souvent faibles, mais importantes en veille)
+        W_AREA = 0.2        # Surface (coût du silicium)
         
-        # Pénalité violente si simulation échouée (valeur 10.0 détectée)
-        if norm_delay >= 10.0 or norm_power >= 10.0:
-            reward = -50.0 # Punition très forte pour éviter ces zones
+        # Note : La somme n'a pas besoin de faire 1.0, c'est relatif.
+        
+        # Le reward est négatif car on minimise
+        reward = - (W_DELAY * norm_delay + 
+                    W_P_STAT * norm_p_stat + 
+                    W_P_DYN * norm_p_dyn + 
+                    W_AREA * norm_area)
+        
+        # Pénalité de crash (si une valeur vaut 10.0 ou 20.0, c'est un échec)
+        if np.any(obs >= 10.0):
+            reward = -50.0 
             
         done = False
         truncated = False
+        
+        # Info pour le debug/affichage
         info = {
             "delay": norm_delay,
-            "power": norm_power,
+            "p_stat": norm_p_stat,
+            "p_dyn": norm_p_dyn,
             "area": norm_area
         }
+        
         return obs, reward, done, truncated, info
     
     def _run_sequence_and_get_results(self):
         """
-        Exécute Delay -> Power -> Retourne vecteur [D, P, A] normalisé
+        Exécute la séquence et retourne [Delay, P_Stat, P_Dyn, Area] (Normalisés)
         """
         W_MIN_PDK = 0.42
         raw_nmos = np.clip(self.current_action[0], W_MIN_PDK, 2.0)
@@ -73,41 +80,54 @@ class NANDOpt(gym.Env):
         
         w_str_values = [f"{raw_nmos}e+06u", f"{raw_pmos}e+06u"]
         
-        FAIL_OBS = np.array([10.0, 10.0, 10.0], dtype=float)
+        # Vecteur d'échec (4 dimensions maintenant)
+        FAIL_OBS = np.array([20.0, 20.0, 20.0, 20.0], dtype=float)
 
         try:
-            # --- ETAPE 1 : DELAY & AREA ---
+            # --- 1. SIMULATION DELAY & AREA ---
             self.testbench.run_specific_simulation("DELAY", w_str_values)
+            if not self.testbench.check_simulation_health(): return FAIL_OBS
+
             res_delay = self.testbench.get_measurements("DELAY")
             
-            # Extraction Delay
+            # Delay
             delays = res_delay.get('delays')
             if not delays: return FAIL_OBS
             avg_delay_ns = np.mean(list(delays.values()))
             
-            # Extraction Area
+            # Area (en m², souvent très petit ex: 1e-12)
             area_val = res_delay.get('area', 0.0)
-            
-            # --- ETAPE 2 : POWER ---
-            self.testbench.run_specific_simulation("POWER", w_str_values)
-            res_power = self.testbench.get_measurements("POWER")
-            
-            power_data = res_power.get('power')
-            if not power_data: return FAIL_OBS
-            
-            p_total = (power_data.get('static', 0.0) + power_data.get('dynamic', 0.0)) / 2.0
 
-            # --- NORMALISATION ---
-            # C'est CRUCIAL pour que l'IA ne favorise pas juste le chiffre le plus gros.
-            # Valeurs cibles arbitraires (à ajuster selon ta techno) :
-            # Delay cible ~ 0.05ns | Power cible ~ 1uW
+            # --- 2. SIMULATION POWER ---
+            self.testbench.run_specific_simulation("POWER", w_str_values)
+            if not self.testbench.check_simulation_health(): return FAIL_OBS
+
+            res_power = self.testbench.get_measurements("POWER")
+            power_data = res_power.get('power', {})
             
-            norm_delay = avg_delay_ns * 10.0  # ex: 0.1ns -> 1.0
-            norm_power = p_total / 1e-6       # ex: 1uW -> 1.0
-            norm_area = area_val * 1.0        # A ajuster selon l'ordre de grandeur
+            p_stat_val = power_data.get('static', 0.0)
+            p_dyn_val = power_data.get('dynamic', 0.0)
+
+            # --- 3. NORMALISATION (Crucial !) ---
+            # Il faut ramener toutes les valeurs autour de 1.0 pour que le réseau de neurones apprenne bien.
             
-            return np.array([norm_delay, norm_power, norm_area], dtype=float)
+            # Cibles arbitraires pour la normalisation :
+            # Delay cible : 0.1 ns
+            # P_Stat cible : 10 nW (1e-8) -> Attention c'est petit !
+            # P_Dyn cible : 1 µW (1e-6)
+            # Area cible : 1 µm² (1e-12)
+            
+            norm_delay = avg_delay_ns * 10.0      # ex: 0.1ns -> 1.0
+            
+            norm_p_stat = p_stat_val / 1e-9       # ex: 10nW -> 10.0 (On divise par 1 nanoWatt)
+            if norm_p_stat > 100: norm_p_stat = 100.0 # Clip pour éviter des explosions
+            
+            norm_p_dyn = p_dyn_val / 1e-6         # ex: 1µW -> 1.0
+            
+            norm_area = area_val        
+            
+            return np.array([norm_delay, norm_p_stat, norm_p_dyn, norm_area], dtype=float)
 
         except Exception as e:
-            logger.error(f"Erreur séquentielle : {e}")
+            logger.error(f"Erreur run sequence: {e}")
             return FAIL_OBS

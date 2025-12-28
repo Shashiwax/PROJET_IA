@@ -1,122 +1,192 @@
 import os
 import sys
 import numpy as np
+import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from loguru import logger
-import RL_Nand  # Ton fichier d'environnement
+import warnings
+import RL_Nand
+
+# --- FILTRAGE WARNINGS ---
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # --- CONFIGURATION ---
 DELAY_NETLIST = "LIB_Hyppo/nand_delay.cir"
 POWER_NETLIST = "LIB_Hyppo/nand_power.cir"
-MODEL_NAME = "ppo_nand_multi_obj"  # Nom du fichier de sauvegarde (sans .zip)
-TRAINING_STEPS = 5000             # Nombre de steps d'entrainement
+MODEL_NAME = "sac_nand_normalized" 
+TRAINING_STEPS = 5000
 LEARNING_RATE = 0.0003
-TRAINING = True
+
+# AUGMENTATION MASSIVE POUR AVOIR UN BEAU PARETO
+# Avec ton optimisation de vitesse, 2000 sims devraient prendre ~1 à 2 minutes max
+N_RANDOM_SAMPLES = 2000 
+
+MODE = "VERIFICATION" # "TRAINING" ou "VERIFICATION"
 
 def get_env():
-    """Crée et retourne l'environnement configuré."""
-    # Vérification basique de l'existence des fichiers
     if not os.path.exists(DELAY_NETLIST) or not os.path.exists(POWER_NETLIST):
-        logger.error("Fichiers netlist introuvables. Vérifiez les chemins dans la configuration.")
+        logger.error("Netlists introuvables.")
         sys.exit(1)
-        
     return RL_Nand.NANDOpt(delay_netlist=DELAY_NETLIST, power_netlist=POWER_NETLIST)
 
+def get_pareto_frontier(Xs, Ys, maxX=False, maxY=False):
+    """
+    Calcule la frontière de Pareto pour un nuage de points 2D.
+    Retourne les listes X et Y triées des points optimaux.
+    """
+    # On combine les listes et on trie par X
+    sorted_list = sorted([[Xs[i], Ys[i]] for i in range(len(Xs))], key=lambda x: x[0])
+    
+    pareto_front = [sorted_list[0]]
+    
+    for pair in sorted_list[1:]:
+        if maxY: 
+            if pair[1] >= pareto_front[-1][1]: # Si on maximise Y
+                pareto_front.append(pair)
+        else:
+            if pair[1] <= pareto_front[-1][1]: # Si on minimise Y (cas standard ici)
+                pareto_front.append(pair)
+    
+    # Séparation pour le plot
+    p_xs = [x[0] for x in pareto_front]
+    p_ys = [x[1] for x in pareto_front]
+    return p_xs, p_ys
+
 def train_new_model():
-    """Entraîne un nouveau modèle et le sauvegarde."""
     env = get_env()
+    # Vectorisation et Normalisation
+    vec_env = DummyVecEnv([lambda: env])
+    env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=100.)
     
-    logger.info(f"Démarrage de l'entraînement pour {TRAINING_STEPS} steps...")
-    
-    # MlpPolicy est adapté pour des vecteurs de chiffres (pas d'images)
+    logger.info(f"Entraînement ({TRAINING_STEPS} steps)...")
     model = PPO("MlpPolicy", env, verbose=1, learning_rate=LEARNING_RATE)
     model.learn(total_timesteps=TRAINING_STEPS)
     
-    logger.success("Entraînement terminé.")
     model.save(MODEL_NAME)
-    logger.info(f"Modèle sauvegardé sous '{MODEL_NAME}.zip'")
-    
+    env.save(f"{MODEL_NAME}_vecnormalize.pkl")
+    logger.success("Modèle sauvegardé.")
     return model
 
-def run_verification(model=None):
-    """
-    Charge le modèle (si nécessaire) et cherche le point optimal de fonctionnement.
-    Affiche les résultats physiques interprétés.
-    """
-    env = get_env()
+def run_verification_and_plot(model=None):
+    raw_env = get_env()
+    vec_env = DummyVecEnv([lambda: raw_env])
     
-    # Si aucun modèle n'est passé en argument (cas du chargement direct), on le charge du disque
+    # Chargement normalisation
+    stats_path = f"{MODEL_NAME}_vecnormalize.pkl"
+    if os.path.exists(stats_path):
+        env_norm = VecNormalize.load(stats_path, vec_env)
+        env_norm.training = False
+        env_norm.norm_reward = False
+    else:
+        env_norm = vec_env
+
+    # Chargement modèle
     if model is None:
         if not os.path.exists(f"{MODEL_NAME}.zip"):
-            logger.error(f"Le fichier modèle '{MODEL_NAME}.zip' n'existe pas. Veuillez d'abord entraîner le modèle.")
+            logger.error("Modèle introuvable.")
             return
-        logger.info(f"Chargement du modèle '{MODEL_NAME}' depuis le disque...")
-        model = PPO.load(MODEL_NAME, env=env)
+        model = PPO.load(MODEL_NAME, env=env_norm)
 
-    logger.info("Lancement de la phase de test/vérification...")
+    # --- 1. POINT IA ---
+    logger.info("Calcul du point optimal IA...")
+    obs = env_norm.reset()
+    last_info = {}
+    ai_best_action = None
     
-    # Reset initial
-    obs, _ = env.reset()
-    
-    final_action = None
-    final_info = {}
-
-    print("\n" + "="*80)
-    print(f"{'Step':<5} | {'W_NMOS (µm)':<12} | {'W_PMOS (µm)':<12} | {'Reward':<10} | {'Délai Norm.':<12} | {'Power Norm.':<12}")
-    print("="*80)
-
-    # Boucle de convergence (Mode Déterministe)
-    # On laisse l'agent stabiliser sa décision sur 10 itérations
-    for i in range(10):
+    for _ in range(10):
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, truncated, info = env.step(action)
-        
-        final_action = action
-        final_info = info
-        
-        d_val = info.get('delay', 0.0)
-        p_val = info.get('power', 0.0)
-        
-        print(f"{i+1:<5} | {action[0]:.4f}       | {action[1]:.4f}       | {reward:.4f}     | {d_val:.4f}       | {p_val:.4f}")
+        obs, _, _, infos = env_norm.step(action)
+        last_info = infos[0]
+        ai_best_action = action[0]
 
-    # --- INTERPRÉTATION DES RÉSULTATS ---
-    print("="*80)
-    print(" RÉSULTATS FINAUX OPTIMISÉS")
-    print("="*80)
-    
-    # 1. Les paramètres géométriques à utiliser
-    w_nmos = final_action[0]
-    w_pmos = final_action[1]
-    
-    print(f"Paramètres du Design :")
-    print(f"  -> W_NMOS : {w_nmos:.4f} µm")
-    print(f"  -> W_PMOS : {w_pmos:.4f} µm")
-    print(f"  -> Ratio P/N : {w_pmos/w_nmos:.2f}")
+    # Récupération IA (Unités physiques)
+    ai_metrics = {
+        'delay': last_info.get('delay', 0.0) / 10.0,    # ns
+        'area': last_info.get('area', 0.0),             # um2
+        'p_stat': last_info.get('p_stat', 0.0),         # nW (déjà à l'échelle si RL_Nand divise par 1e-9)
+        'p_dyn': last_info.get('p_dyn', 0.0),           # uW (déjà à l'échelle si RL_Nand divise par 1e-6)
+    }
+    ai_metrics['p_tot'] = (ai_metrics['p_stat']*1e-3) + ai_metrics['p_dyn'] # uW
 
-    # 2. Les performances physiques estimées
-    # Note : Il faut inverser la normalisation faite dans RL_Nand pour retrouver les vraies unités
-    # Dans RL_Nand : norm_delay = avg_delay_ns * 10.0  => avg_delay_ns = norm / 10.0
-    # Dans RL_Nand : norm_power = p_total / 1e-6       => p_total = norm * 1e-6
+    print(f"IA Result -> Delay: {ai_metrics['delay']:.4f}ns | Area: {ai_metrics['area']:.2f}um2")
+
+    # --- 2. GENERATION MASSIVE (Monte Carlo) ---
+    logger.info(f"Génération du nuage de {N_RANDOM_SAMPLES} points (Patientez ~1min)...")
+    logger.disable("pyngs")
     
-    norm_delay = final_info.get('delay', 0.0)
-    norm_power = final_info.get('power', 0.0)
+    # Listes pour stocker les données brutes
+    data = {'delay': [], 'area': [], 'p_tot': [], 'p_dyn': [], 'p_stat': []}
     
-    real_delay_ns = norm_delay / 10.0
-    real_power_w = norm_power * 1e-6
+    # On utilise raw_env pour sampler (plus simple)
+    # Note: On échantillonne directement l'espace physique ou l'espace d'action
     
-    print(f"\nPerformances Estimées :")
-    print(f"  -> Délai Moyen : {real_delay_ns:.5f} ns")
-    print(f"  -> Puissance   : {real_power_w*1e6:.3f} µW")
-    print("="*80)
+    for i in range(N_RANDOM_SAMPLES):
+        if i % 100 == 0: print(f"Sampling {i}/{N_RANDOM_SAMPLES}...", end='\r')
+        
+        act = raw_env.action_space.sample()
+        _, _, _, _, info = raw_env.step(act)
+        
+        if info.get('delay', 100.0) < 10.0: # Filtre crashs
+            d = info['delay'] / 10.0
+            a = info['area']
+            pt = (info['p_stat']*1e-9 + info['p_dyn']*1e-6) * 1e6 # uW
+            
+            data['delay'].append(d)
+            data['area'].append(a)
+            data['p_tot'].append(pt)
+            data['p_stat'].append(info['p_stat']) # nW
+            data['p_dyn'].append(info['p_dyn'])   # uW
+
+    logger.enable("pyngs")
+    print("\nCalcul des fronts de Pareto...")
+
+    # --- 3. PLOTTING ---
+    fig, axs = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle(f"Optimisation IA vs Espace des Possibles ({N_RANDOM_SAMPLES} samples)", fontsize=16)
+
+    def plot_pareto(ax, x_key, y_key, xlabel, ylabel, title):
+        X = data[x_key]
+        Y = data[y_key]
+        
+        # 1. Nuage de points (Gris, haute transparence)
+        ax.scatter(X, Y, c='gray', alpha=0.3, s=20, label='Designs Possibles', edgecolors='none')
+        
+        # 2. Front de Pareto (Calculé mathématiquement)
+        # On minimise X et Y dans tous les cas ici (Delay, Power, Area sont tous à minimiser)
+        p_x, p_y = get_pareto_frontier(X, Y)
+        ax.plot(p_x, p_y, 'b-', linewidth=2, label='Front de Pareto', alpha=0.8)
+        ax.scatter(p_x, p_y, c='blue', s=30)
+
+        # 3. Point IA
+        ax_x = ai_metrics[x_key]
+        ax_y = ai_metrics[y_key]
+        ax.scatter(ax_x, ax_y, c='red', marker='*', s=300, label='IA (PPO)', zorder=10, edgecolors='black')
+        
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.4)
+        ax.legend()
+
+    # Graphique 1 : Delay vs Area (Celui que tu voulais voir)
+    plot_pareto(axs[0, 0], 'delay', 'area', 'Délai (ns)', 'Surface (µm²)', 'Trade-off : Vitesse vs Coût')
+    
+    # Graphique 2 : Delay vs Power
+    plot_pareto(axs[0, 1], 'delay', 'p_tot', 'Délai (ns)', 'Puissance Totale (µW)', 'Trade-off : Vitesse vs Conso')
+    
+    # Graphique 3 : Power vs Area
+    plot_pareto(axs[1, 0], 'p_tot', 'area', 'Puissance (µW)', 'Surface (µm²)', 'Densité de Puissance')
+    
+    # Graphique 4 : Stat vs Dyn
+    plot_pareto(axs[1, 1], 'p_dyn', 'p_stat', 'Puissance Dyn (µW)', 'Puissance Stat (nW)', 'Analyse des Fuites')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
 
 if __name__ == "__main__":
-    print("--- OPTIMISATION DE CELLULE NAND (Delay + Power) ---")
-    
-    if TRAINING:
-        # Entraînement puis Test immédiat avec le modèle en mémoire
-        trained_model = train_new_model()
-        run_verification(model=trained_model)
-        
-    else:
-        # Juste le test en chargeant depuis le disque
-        run_verification(model=None)
+    if MODE == "TRAINING":
+        model = train_new_model()
+        run_verification_and_plot(model)
+    elif MODE == "VERIFICATION":
+        run_verification_and_plot()

@@ -1,137 +1,206 @@
-# train_ppo_parallel.py
-from __future__ import annotations
-
 import os
-import csv
-from pathlib import Path
-from typing import Callable, Dict, Any, List, Tuple
-
+import time
 import numpy as np
+import pandas as pd
+from pathlib import Path
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor
-from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
+from stable_baselines3.common.callbacks import EvalCallback, BaseCallback
+from stable_baselines3.common.utils import set_random_seed
 
 from inverter_env import InverterEnv, RewardConfig
+import argparse
+import json
+from datetime import datetime
+
+def _project_root() -> Path:
+    # Assumes this file lives in <root>/src/
+    return Path(__file__).resolve().parents[1]
 
 
-def best_divisor_leq(n: int, max_d: int) -> int:
-    """Pick the largest divisor of n that is <= max_d. Fallback to n."""
-    for d in range(min(max_d, n), 0, -1):
-        if n % d == 0:
-            return d
-    return n
+def _infer_cell_and_corner(netlist_path: Path) -> tuple[str, str]:
+    # netlist stem like "inv" or "inv_tt"
+    stem = netlist_path.stem
+    parts = stem.split("_")
+    cell = parts[0] if parts and parts[0] else stem
+    corner = parts[1] if len(parts) >= 2 and parts[1] else "tt"
+    return cell, corner
 
 
-def make_env_fn(
-    rank: int,
-    netlist: str,
-    max_steps: int,
-    cfg: RewardConfig,
-    debug: bool,
-) -> Callable[[], InverterEnv]:
-    def _init() -> InverterEnv:
+def _next_run_id(base_dir: Path) -> str:
+    best = 0
+    for p in base_dir.glob("run[0-9][0-9][0-9]"):
+        if p.is_dir():
+            try:
+                n = int(p.name.replace("run", ""))
+                best = max(best, n)
+            except ValueError:
+                pass
+    return f"run{best + 1:03d}"
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--run",
+        type=str,
+        default="",
+        help="Run folder name to reuse (e.g. run001). If omitted, auto-creates runXXX.",
+    )
+    p.add_argument("--resume", action="store_true", help="Resume training from existing model in the run folder.")
+    p.add_argument("--resume-path", type=str, default="", help="Optional explicit path to a .zip to resume from.")
+
+    return p.parse_args()
+
+
+def _resolve_run_dir(netlist_path: Path, run_id: str) -> tuple[Path, str, str, str]:
+    cell, corner = _infer_cell_and_corner(netlist_path)
+    base = _project_root() / "runs" / "ppo" / cell / corner
+    base.mkdir(parents=True, exist_ok=True)
+
+    rid = run_id.strip()
+    if not rid:
+        rid = _next_run_id(base)
+
+    run_dir = base / rid
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir, rid, cell, corner
+
+
+class EvalTraceCallback(BaseCallback):
+    """
+    Logs (on every evaluation) the deterministic best design found so far,
+    and stores a csv trace (time, timesteps, reward, wn, wp, metrics, etc.)
+    """
+    def __init__(self, eval_env: DummyVecEnv, out_csv: Path, n_eval_episodes: int = 6, eval_freq: int = 500, verbose: int = 0):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.out_csv = Path(out_csv)
+        self.n_eval_episodes = n_eval_episodes
+        self.eval_freq = eval_freq
+
+        self.best = None
+        self.rows = []
+
+    def _on_step(self) -> bool:
+        if (self.num_timesteps % self.eval_freq) != 0:
+            return True
+
+        # Deterministic evaluation: do n_eval_episodes rollouts
+        rewards = []
+        best_ep = None
+
+        for _ in range(self.n_eval_episodes):
+            obs = self.eval_env.reset()
+            done = False
+            ep_reward = 0.0
+
+            while not done:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, r, done, info = self.eval_env.step(action)
+                ep_reward += float(r)
+
+            rewards.append(ep_reward)
+
+            # Grab last info dict
+            inf = info[0] if isinstance(info, (list, tuple)) else info
+            if best_ep is None or ep_reward > best_ep["reward"]:
+                best_ep = {"reward": ep_reward, **inf}
+
+        mean_r = float(np.mean(rewards))
+        if self.verbose:
+            print(f"[EvalTrace] t={self.num_timesteps} mean_reward={mean_r:.4f}")
+
+        # Track global best by reward
+        if self.best is None or best_ep["reward"] > self.best["reward"]:
+            self.best = best_ep
+
+        row = {
+            "wall_time_s": time.time(),
+            "timesteps": self.num_timesteps,
+            "eval_mean_reward": mean_r,
+        }
+        # Add best episode fields if present
+        row.update({f"best_{k}": v for k, v in best_ep.items()})
+        # Add global best fields
+        if self.best is not None:
+            row.update({f"global_{k}": v for k, v in self.best.items()})
+
+        self.rows.append(row)
+
+        # Persist CSV
+        df = pd.DataFrame(self.rows)
+        self.out_csv.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(self.out_csv, index=False)
+
+        return True
+
+
+def eval_collect_best(model: PPO, env: InverterEnv, max_steps: int, out_csv: Path) -> dict:
+    """
+    Deterministic eval on a *single* env, collecting best design across the episode.
+    Returns best info dict and saves trace CSV (optional).
+    """
+    obs, _ = env.reset()
+    best = None
+    rows = []
+
+    for _ in range(max_steps):
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env.step(action)
+        r = float(reward)
+
+        if best is None or r > best["reward"]:
+            best = {"reward": r, **info}
+
+        rows.append({"reward": r, **info})
+
+        if terminated or truncated:
+            break
+
+    if out_csv is not None:
+        out_csv = Path(out_csv)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+    return best if best is not None else {}
+
+
+def make_env_fn(rank: int, netlist: Path, max_steps: int, cfg: RewardConfig, seed: int):
+    def _init():
         env = InverterEnv(
             netlist_path=netlist,
             max_steps=max_steps,
             reward_cfg=cfg,
-            seed=1000 + rank,
-            debug=debug,
-            simulate_on_reset=False,  # keep PPO fast
-            # Fast training mode
-            fast_mode=True,
-            fast_tran_step=os.getenv("FAST_TRAN_STEP", "5p"),
-            fast_tsim=os.getenv("FAST_TSIM", "2n"),
-            timeout_s=float(os.getenv("SPICE_TIMEOUT_S", "20")),
-            # Bounds + discretization (reduce crashes)
-            wn_min=float(os.getenv("WN_MIN", "0.20")),
-            wn_max=float(os.getenv("WN_MAX", "1.26")),
-            wp_min=float(os.getenv("WP_MIN", "0.20")),
-            wp_max=float(os.getenv("WP_MAX", "1.65")),
-            snap_step=float(os.getenv("SNAP_STEP", "0.01")),
         )
-        return Monitor(env)
+        env = Monitor(env)
+        env.reset(seed=seed + rank)
+        return env
     return _init
 
 
-def eval_collect_best(
-    model: PPO,
-    env: InverterEnv,
-    n_episodes: int,
-    out_csv: Path,
-) -> Dict[str, Any]:
-    """
-    Run deterministic evaluation and collect the best design (wn/wp + metrics + breakdown).
-    """
-    rows: List[Dict[str, Any]] = []
-    best = None
+def main():
+    NETLIST = Path(os.getenv("NETLIST", "../netlists/inv.cir"))
 
-    for _ in range(n_episodes):
-        obs, info = env.reset(options={"random_reset": True})
-        action, _ = model.predict(obs, deterministic=True)
-        obs, r, term, trunc, info = env.step(action)
-
-        m = info.get("metrics", {})
-        b = info.get("breakdown", {})
-        row = {
-            "reward": float(r),
-            "wn": float(m.get("wn", np.nan)),
-            "wp": float(m.get("wp", np.nan)),
-            "cell_area_um2": float(m.get("cell_area_um2", np.nan)),
-            "delay_max_ps": float(m.get("delay_max_ps", np.nan)),
-            "pstat_wc_uW": float(m.get("pstat_wc_uW", np.nan)),
-            "edyn_fJ": float(m.get("edyn_fJ", np.nan)),
-            "ymean_a0": float(m.get("ymean_a0", np.nan)),
-            "ymean_a1": float(m.get("ymean_a1", np.nan)),
-            "term_area": float(b.get("term_area", np.nan)),
-            "term_delay": float(b.get("term_delay", np.nan)),
-            "term_pstat": float(b.get("term_pstat", np.nan)),
-            "term_edyn": float(b.get("term_edyn", np.nan)),
-            "term_size": float(b.get("term_size", np.nan)),
-            "term_logic": float(b.get("term_logic", np.nan)),
-            "cost": float(b.get("cost", np.nan)),
-            "fail": float(b.get("fail", 0.0)),
-        }
-        rows.append(row)
-        if best is None or row["reward"] > best["reward"]:
-            best = row
-
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    with out_csv.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
-
-    return best or {}
-
-
-def main() -> None:
-    # -------------------------
-    # Config (single source here)
-    # -------------------------
-    NETLIST = os.getenv("NETLIST", "../netlists/inv.cir")
-
-    N_ENVS = int(os.getenv("N_ENVS", "6"))
-    MAX_STEPS = int(os.getenv("MAX_STEPS", "3"))
-    TOTAL_TIMESTEPS = int(os.getenv("TOTAL_TIMESTEPS", "15000"))
+    # Parallelism: start with 4 (good tradeoff on WSL), then try 6-8 if stable.
+    N_ENVS = int(os.getenv("N_ENVS", "4"))
+    MAX_STEPS = int(os.getenv("MAX_STEPS", "6"))
+    TOTAL_TIMESTEPS = int(os.getenv("TOTAL_TIMESTEPS", "30000"))
 
     # PPO rollout params
-    N_STEPS = int(os.getenv("N_STEPS", "120"))  # smaller -> faster feedback (still same total sims)
+    N_STEPS = int(os.getenv("N_STEPS", "92"))
     N_EPOCHS = int(os.getenv("N_EPOCHS", "10"))
 
-    # Compute a safe batch_size (divisor of n_steps*n_envs) to avoid SB3 warning
-    rollout_size = N_STEPS * N_ENVS
-    #BATCH_SIZE = int(os.getenv("BATCH_SIZE", str(best_divisor_leq(rollout_size, 64))))
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "72"))
-
-    # Eval settings (be careful: each eval episode = 1 SPICE sim here)
+    # rollout_size = N_STEPS * N_ENVS
+    BATCH_SIZE = int(os.getenv("BATCH_SIZE", str(N_STEPS)))
     EVAL_FREQ = int(os.getenv("EVAL_FREQ", "2000"))
     N_EVAL_EPISODES = int(os.getenv("N_EVAL_EPISODES", "4"))
 
-    DEBUG = bool(int(os.getenv("DEBUG", "0")))
+    SEED = int(os.getenv("SEED", "0"))
+    set_random_seed(SEED)
 
-    # Reward config (PPO-friendly: bounded fail_reward, soft logic penalties)
     cfg = RewardConfig(
         ref_cell_area_um2=3.7536,
         ref_delay_max_ps=18.96081,
@@ -162,146 +231,107 @@ def main() -> None:
     )
 
     # -------------------------
-    # Vectorized training env
+    # Clean run folder (only file management)
     # -------------------------
-    env_fns = [make_env_fn(i, NETLIST, MAX_STEPS, cfg, DEBUG) for i in range(N_ENVS)]
+    args = _parse_args()
+    run_dir, RUN_ID, CELL_NAME, CORNER = _resolve_run_dir(NETLIST, args.run)
+    tb_log = run_dir / "tb"
+    sb3_dir = run_dir / "sb3"
+    tb_log.mkdir(parents=True, exist_ok=True)
+    sb3_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = run_dir / "ppo_eval_trace.csv"
+    model_path = run_dir / "ppo_inverter_parallel.zip"
+    config_json = run_dir / "config.json"
 
-    start_method = os.getenv("START_METHOD", "spawn")  # "spawn" safer; "fork" faster on linux sometimes
-    vec_env = SubprocVecEnv(env_fns, start_method=start_method)
-    vec_env = VecMonitor(vec_env)
+    # Write config once per run (so you can understand later)
+    if not config_json.exists():
+        config_dump = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "algo": "ppo",
+            "run_id": RUN_ID,
+            "cell": CELL_NAME,
+            "corner": CORNER,
+            "netlist": str(NETLIST),
+            "train": {
+                "N_ENVS": N_ENVS,
+                "MAX_STEPS": MAX_STEPS,
+                "TOTAL_TIMESTEPS": TOTAL_TIMESTEPS,
+                "N_STEPS": N_STEPS,
+                "BATCH_SIZE": BATCH_SIZE,
+                "EVAL_FREQ": EVAL_FREQ,
+                "N_EVAL_EPISODES": N_EVAL_EPISODES,
+                "SEED": SEED,
+            },
+            "reward_cfg": cfg.__dict__,
+        }
+        config_json.write_text(json.dumps(config_dump, indent=2) + "\n")
 
-    # -------------------------
-    # Eval env (single process)
-    # -------------------------
-    eval_env = DummyVecEnv([lambda: Monitor(InverterEnv(
-        netlist_path=NETLIST,
-        max_steps=MAX_STEPS,
-        reward_cfg=cfg,
-        seed=999,
-        debug=False,
-        simulate_on_reset=False,
-        fast_mode=True,
-        fast_tran_step=os.getenv("FAST_TRAN_STEP", "5p"),
-        fast_tsim=os.getenv("FAST_TSIM", "2n"),
-        timeout_s=float(os.getenv("SPICE_TIMEOUT_S", "20")),
-        wn_min=float(os.getenv("WN_MIN", "0.20")),
-        wn_max=float(os.getenv("WN_MAX", "1.26")),
-        wp_min=float(os.getenv("WP_MIN", "0.20")),
-        wp_max=float(os.getenv("WP_MAX", "1.65")),
-        snap_step=float(os.getenv("SNAP_STEP", "0.01")),
-    ))])
+    # Vec env
+    env_fns = [make_env_fn(i, NETLIST, MAX_STEPS, cfg, SEED) for i in range(N_ENVS)]
+    vec_env = SubprocVecEnv(env_fns, start_method="spawn")
 
-    # Early stop if eval does not improve
-    stop_cb = StopTrainingOnNoModelImprovement(
-        max_no_improvement_evals=int(os.getenv("NO_IMPROVE_EVALS", "5")),
-        min_evals=int(os.getenv("MIN_EVALS", "3")),
-        verbose=1,
-    )
+    # Eval env (single)
+    eval_env = DummyVecEnv([lambda: Monitor(InverterEnv(netlist_path=NETLIST, max_steps=MAX_STEPS, reward_cfg=cfg))])
 
+    # Callbacks
     eval_cb = EvalCallback(
-        eval_env=eval_env,
-        callback_after_eval=stop_cb,
+        eval_env,
+        best_model_save_path=str(sb3_dir / "best"),
+        log_path=str(sb3_dir / "eval"),
         eval_freq=EVAL_FREQ,
         n_eval_episodes=N_EVAL_EPISODES,
         deterministic=True,
-        best_model_save_path="./",
-        log_path="./",
-        verbose=1,
+        render=False,
     )
 
-    # -------------------------
-    # PPO model
-    # -------------------------
-    tb_log = Path(os.getenv("TB_LOG", "./tb_ppo_parallel"))
-    tb_log.mkdir(parents=True, exist_ok=True)
-    """
+    trace_cb = EvalTraceCallback(
+        eval_env=eval_env,
+        out_csv=out_csv,
+        n_eval_episodes=N_EVAL_EPISODES,
+        eval_freq=EVAL_FREQ,
+        verbose=0,
+    )
+
+    device = "cpu"  # keep your choice as-is
     model = PPO(
         "MlpPolicy",
         vec_env,
         verbose=1,
         tensorboard_log=str(tb_log),
-        learning_rate=float(os.getenv("LR", "3e-4")),
-        gamma=float(os.getenv("GAMMA", "1.0")),
         n_steps=N_STEPS,
         batch_size=BATCH_SIZE,
         n_epochs=N_EPOCHS,
-        clip_range=float(os.getenv("CLIP", "0.2")),
-        ent_coef=float(os.getenv("ENT", "0.0")),
-    )
-    """
-    model = PPO(
-        "MlpPolicy",
-        vec_env,
-        verbose=1,
-        tensorboard_log=str(tb_log),
+        gamma=0.99,
         learning_rate=3e-4,
-        n_steps=N_STEPS,
-        batch_size=BATCH_SIZE,
-        n_epochs=10,
-        gamma=0.95,           # Standard
-        # AJOUT : Curiosité pour éviter de rester bloqué au maximum (wn=1.26, wp=1.65)
-        ent_coef=0.01,        
         clip_range=0.2,
+        ent_coef=0.00,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        seed=SEED,
+        device=device
     )
 
-
-    print(f"[CFG] netlist={NETLIST}")
-    print(f"[CFG] N_ENVS={N_ENVS} MAX_STEPS={MAX_STEPS} TOTAL_TIMESTEPS={TOTAL_TIMESTEPS}")
-    print(f"[CFG] n_steps={N_STEPS} rollout_size={rollout_size} batch_size={BATCH_SIZE} n_epochs={N_EPOCHS}")
-    print(f"[CFG] fast_mode=True FAST_TSIM={os.getenv('FAST_TSIM','2n')} FAST_TRAN_STEP={os.getenv('FAST_TRAN_STEP','5p')}")
-    print(f"[CFG] fail_reward={cfg.fail_reward} eval_freq={EVAL_FREQ} n_eval_episodes={N_EVAL_EPISODES}")
-
-    # -------------------------
-    # Train
-    # -------------------------
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
-        callback=eval_cb,
-        progress_bar=True,  # avoids tqdm/rich dependency
+        callback=[eval_cb, trace_cb],
+        progress_bar=True,
     )
 
-    # Save final model
-    model.save("ppo_inverter_parallel.zip")
-    print("Saved: ppo_inverter_parallel.zip")
+    model.save(str(model_path))
+    print(f"Saved: {model_path}")
 
-    # -------------------------
-    # Final evaluation: collect chosen design + metrics
-    # -------------------------
-    # We want the actual design the policy chooses, not only mean reward.
-    # Use a raw (non-vec) env instance for detailed metrics.
-    raw_eval_env = InverterEnv(
-        netlist_path=NETLIST,
-        max_steps=MAX_STEPS,
-        reward_cfg=cfg,
-        seed=2025,
-        debug=False,
-        simulate_on_reset=False,
-        fast_mode=True,
-        fast_tran_step=os.getenv("FAST_TRAN_STEP", "5p"),
-        fast_tsim=os.getenv("FAST_TSIM", "2n"),
-        timeout_s=float(os.getenv("SPICE_TIMEOUT_S", "20")),
-        wn_min=float(os.getenv("WN_MIN", "0.20")),
-        wn_max=float(os.getenv("WN_MAX", "1.26")),
-        wp_min=float(os.getenv("WP_MIN", "0.20")),
-        wp_max=float(os.getenv("WP_MAX", "1.65")),
-        snap_step=float(os.getenv("SNAP_STEP", "0.01")),
-    )
-
+    # Deterministic final eval on a single env + save trace in the same run folder by default
+    env_single = InverterEnv(netlist_path=NETLIST, max_steps=MAX_STEPS, reward_cfg=cfg)
     best = eval_collect_best(
         model=model,
-        env=raw_eval_env,
-        n_episodes=int(os.getenv("FINAL_EVAL_EPISODES", "25")),
-        out_csv=Path(os.getenv("FINAL_EVAL_CSV", "ppo_eval_trace.csv")),
+        env=env_single,
+        max_steps=MAX_STEPS,
+        out_csv=Path(os.getenv("FINAL_EVAL_CSV", str(out_csv))),
     )
-    raw_eval_env.close()
 
     print("\n=== PPO BEST DESIGN (deterministic eval) ===")
     for k, v in best.items():
-        print(f"{k:>16s}: {v}")
-
-    # Cleanup
-    vec_env.close()
-    eval_env.close()
+        print(f"{k:>16}: {v}")
 
 
 if __name__ == "__main__":

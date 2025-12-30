@@ -293,28 +293,46 @@ def main():
     )
 
     device = "cpu"  # keep your choice as-is
-    model = PPO(
-        "MlpPolicy",
-        vec_env,
-        verbose=1,
-        tensorboard_log=str(tb_log),
-        n_steps=N_STEPS,
-        batch_size=BATCH_SIZE,
-        n_epochs=N_EPOCHS,
-        gamma=0.99,
-        learning_rate=3e-4,
-        clip_range=0.2,
-        ent_coef=0.00,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        seed=SEED,
-        device=device
-    )
+    # --- Build or resume model ---
+    resume_zip = None
+    if args.resume:
+        if args.resume_path:
+            resume_zip = Path(args.resume_path)
+        else:
+            # Prefer best model if it exists, else fall back to last saved run model
+            cand_best = sb3_dir / "best" / "best_model.zip"
+            cand_last = model_path  # run_dir/ppo_inverter_parallel.zip
+            resume_zip = cand_best if cand_best.exists() else cand_last
+
+        if not resume_zip.exists():
+            raise FileNotFoundError(f"Cannot resume: model not found at {resume_zip}")
+
+        model = PPO.load(str(resume_zip), env=vec_env, device=device)
+    else:
+        model = PPO(
+            "MlpPolicy",
+            vec_env,
+            verbose=1,
+            tensorboard_log=str(tb_log),
+            n_steps=N_STEPS,
+            batch_size=BATCH_SIZE,
+            n_epochs=N_EPOCHS,
+            gamma=0.99,
+            learning_rate=3e-4,
+            clip_range=0.2,
+            ent_coef=0.00,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            seed=SEED,
+            device=device,
+        )
+
 
     model.learn(
         total_timesteps=TOTAL_TIMESTEPS,
         callback=[eval_cb, trace_cb],
         progress_bar=True,
+        reset_num_timesteps=not args.resume,
     )
 
     model.save(str(model_path))

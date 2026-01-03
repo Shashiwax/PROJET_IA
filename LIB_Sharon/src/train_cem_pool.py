@@ -119,10 +119,10 @@ def main() -> None:
     rng = np.random.default_rng(0)
 
     # CEM hyperparameters 
-    n_iters = 17
+    n_iters = 20
     batch_size = 96
     elite_frac = 0.25
-    alpha = 0.5
+    alpha = 0.3
 
     # Policy distribution over (wn, wp) 
     mean = np.array([0.65, 1.00], dtype=np.float32)
@@ -159,7 +159,7 @@ def main() -> None:
                 "wp_bounds": [wp_min, wp_max],
                 "w_bins": W_BINS.tolist(),
                 "rng_seed": 0,
-                "pool": {"n_workers": 2, "timeout_s": 25.0},
+                "pool": {"n_workers": 4, "timeout_s": 25.0},
             },
             "reward_cfg": cfg.__dict__,
         }

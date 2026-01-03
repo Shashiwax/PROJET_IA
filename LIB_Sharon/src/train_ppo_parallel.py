@@ -1,3 +1,6 @@
+""""Train an inverter sizing agent with PPO in parallel.
+Author: Sharon Bikobo
+"""
 import os
 import time
 import numpy as np
@@ -16,12 +19,12 @@ import json
 from datetime import datetime
 
 def _project_root() -> Path:
-    # Assumes this file lives in <root>/src/
+    # Define project's root directory 
     return Path(__file__).resolve().parents[1]
 
 
 def _infer_cell_and_corner(netlist_path: Path) -> tuple[str, str]:
-    # netlist stem like "inv" or "inv_tt"
+    # Retrieve cell name and corner: in this case only concern an inverter with a corner "tt"
     stem = netlist_path.stem
     parts = stem.split("_")
     cell = parts[0] if parts and parts[0] else stem
@@ -292,7 +295,7 @@ def main():
         verbose=0,
     )
 
-    device = "cpu"  # keep your choice as-is
+    device = "cpu"  
     # --- Build or resume model ---
     resume_zip = None
     if args.resume:

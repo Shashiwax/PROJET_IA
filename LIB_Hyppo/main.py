@@ -17,14 +17,14 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # --- CONFIGURATION ---
 DELAY_NETLIST = "LIB_Hyppo/nand_delay.cir"
 POWER_NETLIST = "LIB_Hyppo/nand_power.cir"
-MODEL_NAME = "ppo_nand_normalized" 
+MODEL_NAME = "LIB_Hyppo/ppo_nand_normalized" 
 LOG_FILE = f"{MODEL_NAME}_training_log.pkl"
 
 TRAINING_STEPS = 10000
 LEARNING_RATE = 0.0006
 N_RANDOM_SAMPLES = 2000 
 
-MODE = "TRAINING" # "TRAINING" ou "VERIFICATION"
+MODE = "VERIFICATION" # "TRAINING" ou "VERIFICATION"
 
 # --- CLASSE CALLBACK POUR LOGGUER LES METRIQUES INTERNES ---
 class TrainingMetricsCallback(BaseCallback):
@@ -199,6 +199,7 @@ def plot_training_convergence():
 
 def run_verification_and_plot(model=None):
     raw_env = get_env()
+    # On garde le VecEnv pour charger la normalisation correctement
     vec_env = DummyVecEnv([lambda: raw_env])
     
     # Chargement normalisation
@@ -221,44 +222,70 @@ def run_verification_and_plot(model=None):
     logger.info("Calcul du point optimal IA...")
     obs = env_norm.reset()
     last_info = {}
+    ai_best_action = None
     
+    # On laisse l'IA stabiliser son choix sur quelques steps
     for _ in range(10):
         action, _ = model.predict(obs, deterministic=True)
-        obs, _, _, infos = env_norm.step(action)
-        last_info = infos[0]
+        step_result = env_norm.step(action)
+        
+        # --- CORRECTION CRITIQUE ICI ---
+        # VecEnv renvoie une LISTE d'infos (une par env). On prend la [0].
+        last_info = step_result[-1][0] 
+        obs = step_result[0]
+        
+        ai_best_action = action[0] # action est aussi une liste [[wn, wp]]
 
+    # Récupération IA (Unités physiques)
     ai_metrics = {
-        'delay': last_info.get('delay', 0.0) / 10.0,
-        'area': last_info.get('area', 0.0),
-        'p_stat': last_info.get('p_stat', 0.0),
-        'p_dyn': last_info.get('p_dyn', 0.0),
+        'delay': last_info.get('delay', 0.0) / 10.0,    # ns
+        'area': last_info.get('area', 0.0),             # um2
+        'p_stat': last_info.get('p_stat', 0.0),         # nW
+        'p_dyn': last_info.get('p_dyn', 0.0),           # uW
     }
-    ai_metrics['p_tot'] = (ai_metrics['p_stat']*1e-3) + ai_metrics['p_dyn']
+    ai_metrics['p_tot'] = (ai_metrics['p_stat']*1e-3) + ai_metrics['p_dyn'] # uW
 
-    print(f"IA Result -> Delay: {ai_metrics['delay']:.4f}ns | Area: {ai_metrics['area']:.2f}um2")
+    # --- AFFICHAGE DU COUPLE Wn / Wp ---
+    # On essaie de récupérer les valeurs exactes depuis 'info' si disponibles
+    # Sinon on dénormalise l'action (approximatif si l'env ne renvoie pas wn/wp)
+    wn_val = last_info.get('wn', ai_best_action[0])
+    wp_val = last_info.get('wp', ai_best_action[1])
+
+    print("-" * 50)
+    print(f" RÉSULTAT FINAL DE L'OPTIMISATION IA ")
+    print("-" * 50)
+    print(f" PARAMÈTRES TROUVÉS :")
+    print(f" > Wn (NMOS) : {wn_val:.4f} µm")
+    print(f" > Wp (PMOS) : {wp_val:.4f} µm")
+    print("-" * 50)
+    print(f" PERFORMANCES :")
+    print(f" > Délai     : {ai_metrics['delay']:.4f} ns")
+    print(f" > Surface   : {ai_metrics['area']:.2f} µm²")
+    print(f" > Puissance : {ai_metrics['p_tot']:.2f} µW")
+    print("-" * 50)
+
 
     # --- 2. GENERATION MASSIVE (Pareto) ---
     logger.info(f"Génération du nuage de {N_RANDOM_SAMPLES} points...")
-    logger.disable("pyngs")
+    logger.disable("pyngs") 
     
     data = {'delay': [], 'area': [], 'p_tot': [], 'p_dyn': [], 'p_stat': []}
     
     for i in range(N_RANDOM_SAMPLES):
         if i % 200 == 0: print(f"Sampling {i}/{N_RANDOM_SAMPLES}...", end='\r')
         
+        # Ici on utilise raw_env directement (pas vectorisé) pour le sampling aléatoire
+        # Donc ici step renvoie (obs, reward, done, info) ou (obs, rew, term, trunc, info)
         act = raw_env.action_space.sample()
-        
-        # --- CORRECTION ICI ---
-        # On récupère le résultat complet et on prend juste le dernier élément (info)
-        # Cela marche que step() renvoie 4 ou 5 valeurs.
         step_result = raw_env.step(act)
-        info = step_result[-1] 
-        # ----------------------
         
-        if info.get('delay', 100.0) < 10.0:
+        # Pour raw_env (Gym standard), info est juste un dict, pas une liste.
+        info = step_result[-1]
+        
+        if info.get('delay', 100.0) < 10.0: # Filtre crashs
             d = info['delay'] / 10.0
             a = info['area']
-            pt = (info['p_stat']*1e-9 + info['p_dyn']*1e-6) * 1e6
+            pt = (info['p_stat']*1e-9 + info['p_dyn']*1e-6) * 1e6 
             
             data['delay'].append(d)
             data['area'].append(a)
@@ -269,7 +296,7 @@ def run_verification_and_plot(model=None):
     logger.enable("pyngs")
     print("\nCalcul des fronts de Pareto et affichage...")
 
-    # --- 3. AFFICHAGE DE LA CONVERGENCE ---
+    # --- 3. AFFICHAGE CONVERGENCE ---
     plot_training_convergence()
 
     # --- 4. AFFICHAGE PARETO ---
@@ -282,7 +309,7 @@ def run_verification_and_plot(model=None):
         
         ax.scatter(X, Y, c='gray', alpha=0.3, s=20, label='Designs Possibles', edgecolors='none')
         
-        if len(X) > 0: # Sécurité si la liste est vide
+        if len(X) > 0:
             p_x, p_y = get_pareto_frontier(X, Y)
             ax.plot(p_x, p_y, 'b-', linewidth=2, label='Front de Pareto', alpha=0.8)
         

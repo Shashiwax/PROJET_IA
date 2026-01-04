@@ -1,0 +1,41 @@
+* Initialisation
+
+.param vdd=1.8
+.lib /home/tp-soa/Projet_SOA/PROJET_IA/.ciel/sky130A/libs.tech/ngspice/sky130tt.lib.spice tt
+.include /home/tp-soa/Projet_SOA/PROJET_IA/.ciel/sky130A/libs.ref/sky130_fd_sc_hd/spice/sky130_fd_sc_hd.spice
+
+
+Vdd VDD 0 {vdd}
+VNB VNB 0 0
+VPB VPB 0 {vdd}
+
+* Définition des signaux pour forcer les transitions
+
+VA A 0 PWL(
++0 0
++4.9n 0
++5n {vdd} 
++10n {vdd} 
++15n 0)
+
+VB B 0 PWL(
++0 0 
++9.9n 0
++10n {vdd} 
++15n {vdd}
++17n 0)
+
+XU1 A B 0 VNB VPB VDD Xout sky130_fd_sc_hd__xor2_1
+
+.tran 0.01n 20n
+
+* --- MESURES ---
+.meas tran trise1 TRIG v(A) VAL={vdd/2} RISE=1 TARG v(Xout) VAL={vdd/2} RISE=1
+.meas tran tfall1 TRIG v(B) VAL={vdd/2} RISE=1 TARG v(Xout) VAL={vdd/2} FALL=1
+.meas tran trise2 TRIG v(A) VAL={vdd/2} FALL=1 TARG v(Xout) VAL={vdd/2} RISE=2
+.meas tran tfall2 TRIG v(B) VAL={vdd/2} FALL=1 TARG v(Xout) VAL={vdd/2} FALL=2
+
+
+.meas tran tpd_avg PARAM='(tfall1+tfall2+trise1+trise2)/4'
+
+.end

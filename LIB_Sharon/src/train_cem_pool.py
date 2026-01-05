@@ -230,6 +230,14 @@ def main() -> None:
                 "iter_best_reward": float(top["reward"]),
                 "iter_best_wn": float(top["wn_in"]),
                 "iter_best_wp": float(top["wp_in"]),
+                
+                # --- AJOUTER CES LIGNES ---
+                "iter_best_delay": float(top["delay_max_ps"]),
+                "iter_best_area": float(top["cell_area_um2"]),
+                "iter_best_pstat": float(top["pstat_wc_uW"]),
+                "iter_best_edyn": float(top["edyn_fJ"]),
+                # --------------------------
+
                 "policy_mean_wn": float(mean[0]),
                 "policy_mean_wp": float(mean[1]),
                 "policy_std_wn": float(std[0]),
